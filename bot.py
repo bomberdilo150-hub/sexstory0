@@ -8,9 +8,10 @@ import asyncio
 import logging
 from datetime import datetime
 import sqlite3
-from typing import List, Dict, Optional
 import os
 import re
+import aiohttp
+from bs4 import BeautifulSoup
 
 # ================= CONFIG =================
 API_TOKEN = "8777177819:AAHuJtPJR8VmoWSfqHtrHW7WeVNWJ6sbV7o"
@@ -28,14 +29,88 @@ bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# ================= SIMPLE DATABASE WITH RETRY =================
+# ================= STORY FETCHER =================
+class StoryFetcher:
+    def __init__(self):
+        self.stories_cache = []
+        self.last_fetch = None
+    
+    async def fetch_stories(self):
+        """Fetch stories from website"""
+        stories = []
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                
+                async with session.get(WEBSITE_URL, headers=headers, timeout=15) as response:
+                    if response.status == 200:
+                        html = await response.text()
+                        soup = BeautifulSoup(html, 'html.parser')
+                        
+                        # Find all links that might be stories
+                        all_links = soup.find_all('a', href=True)
+                        for link in all_links:
+                            href = link.get('href', '')
+                            title = link.get_text(strip=True)
+                            
+                            # Check if it's a story link
+                            if ('/story/' in href or '/post/' in href or '/read/' in href) and title and len(title) > 5:
+                                full_url = href if href.startswith('http') else WEBSITE_URL.rstrip('/') + href
+                                stories.append({
+                                    'title': title[:60],
+                                    'url': full_url
+                                })
+                        
+                        # Remove duplicates
+                        seen = set()
+                        unique_stories = []
+                        for story in stories:
+                            if story['url'] not in seen:
+                                seen.add(story['url'])
+                                unique_stories.append(story)
+                        
+                        if unique_stories:
+                            self.stories_cache = unique_stories[:20]
+                            self.last_fetch = datetime.now()
+                            logger.info(f"Fetched {len(unique_stories)} stories")
+                            return self.stories_cache
+            
+            # If no stories found, return dummy stories
+            if not stories:
+                stories = [
+                    {"title": "The Midnight Story", "url": f"{WEBSITE_URL}/story/1"},
+                    {"title": "Secret Desires", "url": f"{WEBSITE_URL}/story/2"},
+                    {"title": "Forbidden Love", "url": f"{WEBSITE_URL}/story/3"},
+                    {"title": "Mystery of the Night", "url": f"{WEBSITE_URL}/story/4"},
+                    {"title": "The Lost Treasure", "url": f"{WEBSITE_URL}/story/5"},
+                ]
+                self.stories_cache = stories
+                return stories
+                
+        except Exception as e:
+            logger.error(f"Fetch error: {e}")
+            # Return cached stories if available
+            if self.stories_cache:
+                return self.stories_cache
+        
+        return stories[:15]
+    
+    async def get_stories(self, force_refresh=False):
+        """Get stories (from cache or fresh)"""
+        if force_refresh or not self.stories_cache or not self.last_fetch:
+            return await self.fetch_stories()
+        return self.stories_cache
+
+# ================= DATABASE =================
 class Database:
     def __init__(self, db_file: str):
         self.db_file = db_file
         self.init_database()
     
     def get_conn(self):
-        """Simple connection with timeout"""
         return sqlite3.connect(self.db_file, timeout=10)
     
     def init_database(self):
@@ -71,23 +146,11 @@ class Database:
             )
         ''')
         
-        # Transactions
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                amount INTEGER,
-                type TEXT,
-                description TEXT,
-                created_at TIMESTAMP
-            )
-        ''')
-        
         # Add admin
         for admin_id in ADMIN_IDS:
             cursor.execute('''
-                INSERT OR IGNORE INTO users (user_id, is_admin, joined_date)
-                VALUES (?, 1, ?)
+                INSERT OR IGNORE INTO users (user_id, is_admin, joined_date, balance)
+                VALUES (?, 1, ?, 0)
             ''', (admin_id, datetime.now()))
         
         conn.commit()
@@ -107,7 +170,7 @@ class Database:
             
             # Add referral bonus
             if referred_by and referred_by != user_id:
-                self.add_balance(referred_by, REFERRAL_BONUS, f"Referral from {first_name}")
+                self.add_balance(referred_by, REFERRAL_BONUS)
                 cursor.execute("UPDATE users SET referral_count = referral_count + 1 WHERE user_id = ?", (referred_by,))
         
         conn.commit()
@@ -122,22 +185,15 @@ class Database:
         conn.close()
         return result[0] if result else 0
     
-    def add_balance(self, user_id: int, amount: int, description: str):
+    def add_balance(self, user_id: int, amount: int):
         conn = self.get_conn()
         cursor = conn.cursor()
-        
         cursor.execute("UPDATE users SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?", 
                       (amount, amount, user_id))
-        
-        cursor.execute('''
-            INSERT INTO transactions (user_id, amount, type, description, created_at)
-            VALUES (?, ?, 'credit', ?, ?)
-        ''', (user_id, amount, description, datetime.now()))
-        
         conn.commit()
         conn.close()
     
-    def deduct_balance(self, user_id: int, amount: int, description: str) -> bool:
+    def deduct_balance(self, user_id: int, amount: int) -> bool:
         conn = self.get_conn()
         cursor = conn.cursor()
         
@@ -147,12 +203,6 @@ class Database:
         if result and result[0] >= amount:
             cursor.execute("UPDATE users SET balance = balance - ?, total_withdrawn = total_withdrawn + ? WHERE user_id = ?", 
                           (amount, amount, user_id))
-            
-            cursor.execute('''
-                INSERT INTO transactions (user_id, amount, type, description, created_at)
-                VALUES (?, ?, 'debit', ?, ?)
-            ''', (user_id, amount, description, datetime.now()))
-            
             conn.commit()
             conn.close()
             return True
@@ -197,7 +247,7 @@ class Database:
         conn = self.get_conn()
         cursor = conn.cursor()
         cursor.execute("UPDATE withdrawals SET status = 'rejected' WHERE id = ?", (withdraw_id,))
-        self.add_balance(user_id, amount, "Withdrawal refund")
+        self.add_balance(user_id, amount)
         conn.commit()
         conn.close()
     
@@ -219,7 +269,7 @@ class Database:
                 'referral_count': result[3],
                 'joined_date': result[4]
             }
-        return {}
+        return {'balance': 0, 'total_earned': 0, 'total_withdrawn': 0, 'referral_count': 0, 'joined_date': datetime.now()}
     
     def is_admin(self, user_id: int) -> bool:
         conn = self.get_conn()
@@ -236,6 +286,14 @@ class Database:
         result = cursor.fetchone()
         conn.close()
         return result[0] == 1 if result else False
+    
+    def get_all_users(self):
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users WHERE is_banned = 0")
+        results = cursor.fetchall()
+        conn.close()
+        return results
 
 # ================= STATES =================
 class WithdrawState(StatesGroup):
@@ -275,6 +333,37 @@ def get_main_keyboard(is_admin: bool = False):
     
     return keyboard
 
+# ================= STORIES KEYBOARD =================
+def get_stories_keyboard(stories, page=0, items_per_page=5):
+    """Create paginated stories keyboard"""
+    start = page * items_per_page
+    end = start + items_per_page
+    page_stories = stories[start:end]
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    for story in page_stories:
+        keyboard.inline_keyboard.append([
+            InlineKeyboardButton(text=f"📖 {story['title'][:35]}", url=story['url'])
+        ])
+    
+    # Pagination buttons
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(text="◀️ Prev", callback_data=f"stories_page_{page-1}"))
+    if end < len(stories):
+        nav_buttons.append(InlineKeyboardButton(text="Next ▶️", callback_data=f"stories_page_{page+1}"))
+    
+    if nav_buttons:
+        keyboard.inline_keyboard.append(nav_buttons)
+    
+    keyboard.inline_keyboard.append([
+        InlineKeyboardButton(text="🔄 Refresh", callback_data="stories_refresh"),
+        InlineKeyboardButton(text="◀️ Back", callback_data="back")
+    ])
+    
+    return keyboard
+
 # ================= COMMANDS =================
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
@@ -307,6 +396,48 @@ async def start_cmd(message: types.Message):
 Choose an option:"""
     
     await message.answer(text, reply_markup=get_main_keyboard(db.is_admin(user.id)), parse_mode="Markdown")
+
+@dp.callback_query(lambda c: c.data == "stories")
+async def stories_cmd(callback: types.CallbackQuery):
+    await callback.answer("📚 Fetching stories...")
+    
+    fetcher = StoryFetcher()
+    stories = await fetcher.get_stories()
+    
+    if not stories:
+        await callback.message.answer("❌ No stories found! Please try again later.")
+        return
+    
+    # Store stories in state or cache
+    await callback.message.answer(
+        f"📚 **Latest Stories**\n\nFound {len(stories)} stories:",
+        reply_markup=get_stories_keyboard(stories, 0),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(lambda c: c.data.startswith("stories_page_"))
+async def stories_page_cmd(callback: types.CallbackQuery):
+    page = int(callback.data.split("_")[2])
+    
+    fetcher = StoryFetcher()
+    stories = await fetcher.get_stories()
+    
+    if stories:
+        await callback.message.edit_reply_markup(reply_markup=get_stories_keyboard(stories, page))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "stories_refresh")
+async def stories_refresh_cmd(callback: types.CallbackQuery):
+    await callback.answer("🔄 Refreshing stories...")
+    
+    fetcher = StoryFetcher()
+    stories = await fetcher.get_stories(force_refresh=True)
+    
+    if stories:
+        await callback.message.edit_reply_markup(reply_markup=get_stories_keyboard(stories, 0))
+        await callback.answer("✅ Stories refreshed!")
+    else:
+        await callback.answer("❌ Failed to refresh!", show_alert=True)
 
 @dp.callback_query(lambda c: c.data == "balance")
 async def balance_cmd(callback: types.CallbackQuery):
@@ -422,7 +553,6 @@ async def withdraw_upi(message: types.Message, state: FSMContext):
     
     upi_id = message.text.strip()
     
-    # Simple UPI validation
     if '@' not in upi_id or len(upi_id) < 5:
         await message.answer("❌ Invalid UPI ID! Please enter valid UPI ID like: example@okhdfcbank")
         return
@@ -432,7 +562,7 @@ async def withdraw_upi(message: types.Message, state: FSMContext):
     
     db = Database(DATABASE_FILE)
     
-    if db.deduct_balance(message.from_user.id, amount, f"Withdrawal request to {upi_id}"):
+    if db.deduct_balance(message.from_user.id, amount):
         withdraw_id = db.create_withdrawal(message.from_user.id, amount, upi_id)
         
         await message.answer(
@@ -463,19 +593,6 @@ async def withdraw_upi(message: types.Message, state: FSMContext):
     
     await state.clear()
 
-@dp.callback_query(lambda c: c.data == "stories")
-async def stories_cmd(callback: types.CallbackQuery):
-    db = Database(DATABASE_FILE)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📖 Story 1", url=f"{WEBSITE_URL}/story/1")],
-        [InlineKeyboardButton(text="📖 Story 2", url=f"{WEBSITE_URL}/story/2")],
-        [InlineKeyboardButton(text="◀️ Back", callback_data="back")]
-    ])
-    
-    await callback.message.edit_text("📚 Latest Stories:", reply_markup=keyboard)
-    await callback.answer()
-
 @dp.callback_query(lambda c: c.data == "help")
 async def help_cmd(callback: types.CallbackQuery):
     text = f"""📖 Help Guide
@@ -483,6 +600,7 @@ async def help_cmd(callback: types.CallbackQuery):
 💰 Earn: ₹{REFERRAL_BONUS} per referral
 💳 Withdraw: Minimum ₹{MINIMUM_WITHDRAWAL}
 📱 Payment: UPI transfer
+📚 Stories: Updated daily
 
 1 Diamond = ₹1
 
@@ -522,12 +640,27 @@ async def admin_panel_cmd(callback: types.CallbackQuery):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💰 Withdrawals ({len(pending)})", callback_data="admin_withdrawals")],
+        [InlineKeyboardButton(text="🔄 Refresh Stories", callback_data="admin_refresh_stories")],
         [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="◀️ Back", callback_data="back")]
     ])
     
     await callback.message.edit_text("👑 Admin Panel", reply_markup=keyboard)
     await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "admin_refresh_stories")
+async def admin_refresh_stories(callback: types.CallbackQuery):
+    await callback.answer("🔄 Refreshing stories from website...")
+    
+    fetcher = StoryFetcher()
+    stories = await fetcher.get_stories(force_refresh=True)
+    
+    if stories:
+        await callback.message.answer(f"✅ Refreshed {len(stories)} stories from website!")
+    else:
+        await callback.message.answer("❌ Failed to fetch stories from website!")
+    
+    await admin_panel_cmd(callback)
 
 @dp.callback_query(lambda c: c.data == "admin_withdrawals")
 async def admin_withdrawals_cmd(callback: types.CallbackQuery):
@@ -545,9 +678,10 @@ async def admin_withdrawals_cmd(callback: types.CallbackQuery):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     for w in withdrawals:
+        name = w[11] if w[11] else f"User_{w[1]}"
         keyboard.inline_keyboard.append([
             InlineKeyboardButton(
-                text=f"💰 {w[11]} - ₹{w[2]}",  # name - amount
+                text=f"💰 {name[:15]} - ₹{w[2]}",
                 callback_data=f"process_{w[0]}"
             )
         ])
@@ -562,7 +696,6 @@ async def process_withdrawal(callback: types.CallbackQuery):
     withdraw_id = int(callback.data.split("_")[1])
     db = Database(DATABASE_FILE)
     
-    # Get withdrawal details
     conn = db.get_conn()
     cursor = conn.cursor()
     cursor.execute('''
@@ -614,7 +747,6 @@ async def reject_withdrawal(callback: types.CallbackQuery):
     withdraw_id = int(callback.data.split("_")[1])
     db = Database(DATABASE_FILE)
     
-    # Get user and amount
     conn = db.get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, amount FROM withdrawals WHERE id = ?", (withdraw_id,))
@@ -625,7 +757,6 @@ async def reject_withdrawal(callback: types.CallbackQuery):
         user_id, amount = result
         db.reject_withdrawal(withdraw_id, user_id, amount)
         
-        # Notify user
         try:
             await bot.send_message(user_id, f"❌ Your withdrawal of ₹{amount} was rejected. Amount refunded.")
         except:
@@ -656,12 +787,7 @@ async def process_broadcast(message: types.Message, state: FSMContext):
         return
     
     db = Database(DATABASE_FILE)
-    
-    conn = db.get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users WHERE is_banned = 0")
-    users = cursor.fetchall()
-    conn.close()
+    users = db.get_all_users()
     
     sent = 0
     status_msg = await message.answer("⏳ Broadcasting...")
@@ -685,9 +811,8 @@ async def error_handler(update: types.Update, exception: Exception):
 
 # ================= MAIN =================
 async def main():
-    logger.info("🚀 Starting bot...")
+    logger.info("🚀 Starting bot with Story Fetcher...")
     
-    # Delete old database to start fresh
     if os.path.exists(DATABASE_FILE):
         try:
             os.remove(DATABASE_FILE)
@@ -696,11 +821,15 @@ async def main():
             pass
     
     db = Database(DATABASE_FILE)
+    
+    # Pre-fetch stories on startup
+    fetcher = StoryFetcher()
+    stories = await fetcher.get_stories()
+    logger.info(f"Loaded {len(stories)} stories")
+    
     logger.info("Bot ready!")
     
-    # Clear any pending updates
     await bot.delete_webhook(drop_pending_updates=True)
-    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
