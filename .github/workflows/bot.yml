@@ -3,7 +3,7 @@ name: Telegram Bot Runner
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
 
 jobs:
   run-bot:
@@ -12,15 +12,19 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt
 
-      - name: Run Bot
+      - name: Run bot forever loop
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-        run: timeout 9m python bot.py
+        run: |
+          while true
+          do
+            python bot.py
+            echo restarting...
+            sleep 3
+          done
