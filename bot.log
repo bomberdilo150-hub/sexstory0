@@ -1,0 +1,10 @@
+2026-04-29 12:11:45,776 - __main__ - INFO - Starting SexStory Bot with Admin Panel...
+2026-04-29 12:11:45,900 - __main__ - INFO - Database initialized successfully
+2026-04-29 12:11:45,900 - __main__ - INFO - Database initialized
+2026-04-29 12:11:45,901 - aiogram.dispatcher - INFO - Start polling
+2026-04-29 12:11:46,942 - aiogram.dispatcher - INFO - Run polling for bot @SexStory69_bot id=8777177819 - 'SexStory'
+2026-04-29 12:11:53,187 - __main__ - INFO - Database initialized successfully
+2026-04-29 12:11:53,202 - __main__ - INFO - New user added: 8459969831 (referred by: None)
+2026-04-29 12:11:54,210 - aiogram.event - INFO - Update id=780581884 is handled. Duration 1038 ms by bot id=8777177819
+2026-04-29 12:12:46,699 - __main__ - INFO - Database initialized successfully
+2026-04-29 12:12:47,142 - aiogram.event - INFO - Update id=780581885 is handled. Duration 461 ms by bot id=8777177819
