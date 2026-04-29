@@ -11,6 +11,7 @@ import sqlite3
 from typing import List, Dict, Optional
 import os
 import re
+import time
 
 # ================= CONFIG =================
 API_TOKEN = "8777177819:AAHuJtPJR8VmoWSfqHtrHW7WeVNWJ6sbV7o"
@@ -28,18 +29,32 @@ bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# ================= SIMPLE DATABASE WITH RETRY =================
+# ================= DATABASE WITH LOCK HANDLING =================
 class Database:
     def __init__(self, db_file: str):
         self.db_file = db_file
         self.init_database()
     
     def get_conn(self):
-        """Simple connection with timeout"""
-        return sqlite3.connect(self.db_file, timeout=10)
+        """Get connection with timeout and retry"""
+        for i in range(3):
+            try:
+                conn = sqlite3.connect(self.db_file, timeout=20)
+                conn.execute("PRAGMA journal_mode=WAL")  # WAL mode for better concurrency
+                return conn
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and i < 2:
+                    time.sleep(0.5)
+                    continue
+                raise
+        return None
     
     def init_database(self):
         conn = self.get_conn()
+        if not conn:
+            logger.error("Could not connect to database")
+            return
+        
         cursor = conn.cursor()
         
         # Users table
@@ -71,23 +86,11 @@ class Database:
             )
         ''')
         
-        # Transactions
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                amount INTEGER,
-                type TEXT,
-                description TEXT,
-                created_at TIMESTAMP
-            )
-        ''')
-        
         # Add admin
         for admin_id in ADMIN_IDS:
             cursor.execute('''
-                INSERT OR IGNORE INTO users (user_id, is_admin, joined_date)
-                VALUES (?, 1, ?)
+                INSERT OR IGNORE INTO users (user_id, is_admin, joined_date, balance)
+                VALUES (?, 1, ?, 0)
             ''', (admin_id, datetime.now()))
         
         conn.commit()
@@ -96,26 +99,37 @@ class Database:
     
     def add_user(self, user_id: int, username: str, first_name: str, last_name: str = "", referred_by: int = None):
         conn = self.get_conn()
+        if not conn:
+            return False
+        
         cursor = conn.cursor()
         
-        cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-        if not cursor.fetchone():
-            cursor.execute('''
-                INSERT INTO users (user_id, username, first_name, last_name, joined_date, balance)
-                VALUES (?, ?, ?, ?, ?, 0)
-            ''', (user_id, username, first_name, last_name, datetime.now()))
+        try:
+            cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+            if not cursor.fetchone():
+                cursor.execute('''
+                    INSERT INTO users (user_id, username, first_name, last_name, joined_date, balance)
+                    VALUES (?, ?, ?, ?, ?, 0)
+                ''', (user_id, username, first_name, last_name, datetime.now()))
+                
+                # Add referral bonus
+                if referred_by and referred_by != user_id:
+                    self.add_balance(referred_by, REFERRAL_BONUS, f"Referral from {first_name}")
+                    cursor.execute("UPDATE users SET referral_count = referral_count + 1 WHERE user_id = ?", (referred_by,))
             
-            # Add referral bonus
-            if referred_by and referred_by != user_id:
-                self.add_balance(referred_by, REFERRAL_BONUS, f"Referral from {first_name}")
-                cursor.execute("UPDATE users SET referral_count = referral_count + 1 WHERE user_id = ?", (referred_by,))
-        
-        conn.commit()
-        conn.close()
-        return True
+            conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Add user error: {e}")
+            return False
+        finally:
+            conn.close()
     
     def get_balance(self, user_id: int) -> int:
         conn = self.get_conn()
+        if not conn:
+            return 0
+        
         cursor = conn.cursor()
         cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
         result = cursor.fetchone()
@@ -124,35 +138,27 @@ class Database:
     
     def add_balance(self, user_id: int, amount: int, description: str):
         conn = self.get_conn()
-        cursor = conn.cursor()
+        if not conn:
+            return
         
+        cursor = conn.cursor()
         cursor.execute("UPDATE users SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?", 
                       (amount, amount, user_id))
-        
-        cursor.execute('''
-            INSERT INTO transactions (user_id, amount, type, description, created_at)
-            VALUES (?, ?, 'credit', ?, ?)
-        ''', (user_id, amount, description, datetime.now()))
-        
         conn.commit()
         conn.close()
     
     def deduct_balance(self, user_id: int, amount: int, description: str) -> bool:
         conn = self.get_conn()
-        cursor = conn.cursor()
+        if not conn:
+            return False
         
+        cursor = conn.cursor()
         cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
         result = cursor.fetchone()
         
         if result and result[0] >= amount:
             cursor.execute("UPDATE users SET balance = balance - ?, total_withdrawn = total_withdrawn + ? WHERE user_id = ?", 
                           (amount, amount, user_id))
-            
-            cursor.execute('''
-                INSERT INTO transactions (user_id, amount, type, description, created_at)
-                VALUES (?, ?, 'debit', ?, ?)
-            ''', (user_id, amount, description, datetime.now()))
-            
             conn.commit()
             conn.close()
             return True
@@ -162,6 +168,9 @@ class Database:
     
     def create_withdrawal(self, user_id: int, amount: int, upi_id: str) -> int:
         conn = self.get_conn()
+        if not conn:
+            return 0
+        
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO withdrawals (user_id, amount, upi_id, request_date)
@@ -174,6 +183,9 @@ class Database:
     
     def get_pending_withdrawals(self):
         conn = self.get_conn()
+        if not conn:
+            return []
+        
         cursor = conn.cursor()
         cursor.execute('''
             SELECT w.*, u.first_name, u.username 
@@ -188,6 +200,8 @@ class Database:
     
     def approve_withdrawal(self, withdraw_id: int):
         conn = self.get_conn()
+        if not conn:
+            return
         cursor = conn.cursor()
         cursor.execute("UPDATE withdrawals SET status = 'approved' WHERE id = ?", (withdraw_id,))
         conn.commit()
@@ -195,14 +209,20 @@ class Database:
     
     def reject_withdrawal(self, withdraw_id: int, user_id: int, amount: int):
         conn = self.get_conn()
+        if not conn:
+            return
         cursor = conn.cursor()
         cursor.execute("UPDATE withdrawals SET status = 'rejected' WHERE id = ?", (withdraw_id,))
-        self.add_balance(user_id, amount, "Withdrawal refund")
         conn.commit()
         conn.close()
+        # Refund amount
+        self.add_balance(user_id, amount, "Withdrawal refund")
     
     def get_user_stats(self, user_id: int):
         conn = self.get_conn()
+        if not conn:
+            return {'balance': 0, 'total_earned': 0, 'total_withdrawn': 0, 'referral_count': 0, 'joined_date': datetime.now()}
+        
         cursor = conn.cursor()
         cursor.execute('''
             SELECT balance, total_earned, total_withdrawn, referral_count, joined_date
@@ -219,10 +239,12 @@ class Database:
                 'referral_count': result[3],
                 'joined_date': result[4]
             }
-        return {}
+        return {'balance': 0, 'total_earned': 0, 'total_withdrawn': 0, 'referral_count': 0, 'joined_date': datetime.now()}
     
     def is_admin(self, user_id: int) -> bool:
         conn = self.get_conn()
+        if not conn:
+            return False
         cursor = conn.cursor()
         cursor.execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,))
         result = cursor.fetchone()
@@ -231,6 +253,8 @@ class Database:
     
     def is_banned(self, user_id: int) -> bool:
         conn = self.get_conn()
+        if not conn:
+            return False
         cursor = conn.cursor()
         cursor.execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,))
         result = cursor.fetchone()
@@ -308,8 +332,23 @@ Choose an option:"""
     
     await message.answer(text, reply_markup=get_main_keyboard(db.is_admin(user.id)), parse_mode="Markdown")
 
+@dp.message(Command("help"))
+async def help_cmd_text(message: types.Message):
+    text = f"""📖 Help Guide
+
+💰 Earn: ₹{REFERRAL_BONUS} per referral
+💳 Withdraw: Minimum ₹{MINIMUM_WITHDRAWAL}
+📱 Payment: UPI transfer
+
+Commands:
+/start - Restart bot
+/help - This help"""
+    
+    await message.answer(text, parse_mode="Markdown")
+
 @dp.callback_query(lambda c: c.data == "balance")
 async def balance_cmd(callback: types.CallbackQuery):
+    await callback.answer()
     db = Database(DATABASE_FILE)
     balance = db.get_balance(callback.from_user.id)
     stats = db.get_user_stats(callback.from_user.id)
@@ -324,11 +363,11 @@ async def balance_cmd(callback: types.CallbackQuery):
 💰 Earn ₹{REFERRAL_BONUS} per referral!
 💳 Min withdrawal: ₹{MINIMUM_WITHDRAWAL}"""
     
-    await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
-    await callback.answer()
+    await callback.message.edit_text(text, reply_markup=get_main_keyboard(db.is_admin(callback.from_user.id)), parse_mode="Markdown")
 
 @dp.callback_query(lambda c: c.data == "stats")
 async def stats_cmd(callback: types.CallbackQuery):
+    await callback.answer()
     db = Database(DATABASE_FILE)
     stats = db.get_user_stats(callback.from_user.id)
     
@@ -341,11 +380,11 @@ async def stats_cmd(callback: types.CallbackQuery):
 
 Keep referring to earn more!"""
     
-    await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
-    await callback.answer()
+    await callback.message.edit_text(text, reply_markup=get_main_keyboard(db.is_admin(callback.from_user.id)), parse_mode="Markdown")
 
 @dp.callback_query(lambda c: c.data == "referral")
 async def referral_cmd(callback: types.CallbackQuery):
+    await callback.answer()
     bot_user = await bot.get_me()
     link = f"https://t.me/{bot_user.username}?start={callback.from_user.id}"
     db = Database(DATABASE_FILE)
@@ -361,7 +400,6 @@ async def referral_cmd(callback: types.CallbackQuery):
 • Earned: ₹{stats['total_earned']}
 
 🎁 Per Referral: ₹{REFERRAL_BONUS}
-💳 1 Diamond = ₹1
 
 Share link and start earning!"""
     
@@ -371,10 +409,10 @@ Share link and start earning!"""
     ])
     
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-    await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "withdraw")
 async def withdraw_cmd(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
     db = Database(DATABASE_FILE)
     balance = db.get_balance(callback.from_user.id)
     
@@ -384,7 +422,6 @@ async def withdraw_cmd(callback: types.CallbackQuery, state: FSMContext):
     
     await callback.message.answer(f"💰 Your balance: ₹{balance}\n\nEnter amount to withdraw (min ₹{MINIMUM_WITHDRAWAL}):\nType /cancel")
     await state.set_state(WithdrawState.amount)
-    await callback.answer()
 
 @dp.message(WithdrawState.amount)
 async def withdraw_amount(message: types.Message, state: FSMContext):
@@ -449,12 +486,7 @@ async def withdraw_upi(message: types.Message, state: FSMContext):
             try:
                 await bot.send_message(
                     admin_id,
-                    f"💰 NEW WITHDRAWAL\n"
-                    f"User: {message.from_user.first_name}\n"
-                    f"Amount: ₹{amount}\n"
-                    f"UPI: {upi_id}\n"
-                    f"ID: #{withdraw_id}",
-                    parse_mode="Markdown"
+                    f"💰 NEW WITHDRAWAL\nUser: {message.from_user.first_name}\nAmount: ₹{amount}\nUPI: {upi_id}\nID: #{withdraw_id}"
                 )
             except:
                 pass
@@ -465,8 +497,7 @@ async def withdraw_upi(message: types.Message, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data == "stories")
 async def stories_cmd(callback: types.CallbackQuery):
-    db = Database(DATABASE_FILE)
-    
+    await callback.answer()
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📖 Story 1", url=f"{WEBSITE_URL}/story/1")],
         [InlineKeyboardButton(text="📖 Story 2", url=f"{WEBSITE_URL}/story/2")],
@@ -474,10 +505,10 @@ async def stories_cmd(callback: types.CallbackQuery):
     ])
     
     await callback.message.edit_text("📚 Latest Stories:", reply_markup=keyboard)
-    await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "help")
 async def help_cmd(callback: types.CallbackQuery):
+    await callback.answer()
     text = f"""📖 Help Guide
 
 💰 Earn: ₹{REFERRAL_BONUS} per referral
@@ -491,12 +522,12 @@ Commands:
 /help - This help
 
 Contact @admin for support"""
-    
-    await callback.message.edit_text(text, reply_markup=get_main_keyboard())
-    await callback.answer()
+    db = Database(DATABASE_FILE)
+    await callback.message.edit_text(text, reply_markup=get_main_keyboard(db.is_admin(callback.from_user.id)), parse_mode="Markdown")
 
 @dp.callback_query(lambda c: c.data == "back")
 async def back_cmd(callback: types.CallbackQuery):
+    await callback.answer()
     db = Database(DATABASE_FILE)
     balance = db.get_balance(callback.from_user.id)
     
@@ -507,11 +538,11 @@ async def back_cmd(callback: types.CallbackQuery):
 Choose an option:"""
     
     await callback.message.edit_text(text, reply_markup=get_main_keyboard(db.is_admin(callback.from_user.id)), parse_mode="Markdown")
-    await callback.answer()
 
 # ================= ADMIN PANEL =================
 @dp.callback_query(lambda c: c.data == "admin_panel")
 async def admin_panel_cmd(callback: types.CallbackQuery):
+    await callback.answer()
     db = Database(DATABASE_FILE)
     
     if not db.is_admin(callback.from_user.id):
@@ -527,10 +558,10 @@ async def admin_panel_cmd(callback: types.CallbackQuery):
     ])
     
     await callback.message.edit_text("👑 Admin Panel", reply_markup=keyboard)
-    await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "admin_withdrawals")
 async def admin_withdrawals_cmd(callback: types.CallbackQuery):
+    await callback.answer()
     db = Database(DATABASE_FILE)
     
     if not db.is_admin(callback.from_user.id):
@@ -545,9 +576,10 @@ async def admin_withdrawals_cmd(callback: types.CallbackQuery):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     for w in withdrawals:
+        name = w[11] if w[11] else f"User_{w[1]}"
         keyboard.inline_keyboard.append([
             InlineKeyboardButton(
-                text=f"💰 {w[11]} - ₹{w[2]}",  # name - amount
+                text=f"💰 {name[:15]} - ₹{w[2]}",
                 callback_data=f"process_{w[0]}"
             )
         ])
@@ -555,15 +587,19 @@ async def admin_withdrawals_cmd(callback: types.CallbackQuery):
     keyboard.inline_keyboard.append([InlineKeyboardButton(text="◀️ Back", callback_data="admin_panel")])
     
     await callback.message.edit_text(f"💰 Pending Withdrawals ({len(withdrawals)})", reply_markup=keyboard)
-    await callback.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("process_"))
 async def process_withdrawal(callback: types.CallbackQuery):
+    await callback.answer()
     withdraw_id = int(callback.data.split("_")[1])
     db = Database(DATABASE_FILE)
     
     # Get withdrawal details
     conn = db.get_conn()
+    if not conn:
+        await callback.message.answer("Database error!")
+        return
+    
     cursor = conn.cursor()
     cursor.execute('''
         SELECT w.*, u.first_name, u.username 
@@ -595,7 +631,6 @@ async def process_withdrawal(callback: types.CallbackQuery):
 Approve or Reject?"""
     
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-    await callback.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("approve_"))
 async def approve_withdrawal(callback: types.CallbackQuery):
@@ -616,20 +651,21 @@ async def reject_withdrawal(callback: types.CallbackQuery):
     
     # Get user and amount
     conn = db.get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, amount FROM withdrawals WHERE id = ?", (withdraw_id,))
-    result = cursor.fetchone()
-    conn.close()
-    
-    if result:
-        user_id, amount = result
-        db.reject_withdrawal(withdraw_id, user_id, amount)
+    if conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, amount FROM withdrawals WHERE id = ?", (withdraw_id,))
+        result = cursor.fetchone()
+        conn.close()
         
-        # Notify user
-        try:
-            await bot.send_message(user_id, f"❌ Your withdrawal of ₹{amount} was rejected. Amount refunded.")
-        except:
-            pass
+        if result:
+            user_id, amount = result
+            db.reject_withdrawal(withdraw_id, user_id, amount)
+            
+            # Notify user
+            try:
+                await bot.send_message(user_id, f"❌ Your withdrawal of ₹{amount} was rejected. Amount refunded.")
+            except:
+                pass
     
     await callback.answer("❌ Rejected!", show_alert=True)
     await callback.message.edit_text("❌ Withdrawal rejected!")
@@ -638,6 +674,7 @@ async def reject_withdrawal(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "admin_broadcast")
 async def admin_broadcast_cmd(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
     db = Database(DATABASE_FILE)
     
     if not db.is_admin(callback.from_user.id):
@@ -646,7 +683,6 @@ async def admin_broadcast_cmd(callback: types.CallbackQuery, state: FSMContext):
     
     await callback.message.answer("📢 Send message to broadcast:\nType /cancel")
     await state.set_state(AdminState.broadcast)
-    await callback.answer()
 
 @dp.message(AdminState.broadcast)
 async def process_broadcast(message: types.Message, state: FSMContext):
@@ -658,6 +694,10 @@ async def process_broadcast(message: types.Message, state: FSMContext):
     db = Database(DATABASE_FILE)
     
     conn = db.get_conn()
+    if not conn:
+        await message.answer("Database error!")
+        return
+    
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM users WHERE is_banned = 0")
     users = cursor.fetchall()
@@ -698,9 +738,10 @@ async def main():
     db = Database(DATABASE_FILE)
     logger.info("Bot ready!")
     
-    # Clear any pending updates
+    # Clear webhook to avoid conflicts
     await bot.delete_webhook(drop_pending_updates=True)
     
+    # Start polling
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
