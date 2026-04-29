@@ -7,14 +7,14 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import asyncio
 import logging
 from datetime import datetime
-import sqlite3
+import json
 import os
 import re
 
 # ================= CONFIG =================
 API_TOKEN = "8777177819:AAHuJtPJR8VmoWSfqHtrHW7WeVNWJ6sbV7o"
 WEBSITE_URL = "https://sexstory.lovable.app"
-DATABASE_FILE = "bot_database.db"
+DATA_FILE = "bot_data.json"
 ADMIN_IDS = [8459969831]
 
 REFERRAL_BONUS = 10
@@ -27,166 +27,170 @@ bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# ================= SIMPLE DATABASE (NO LOCK ISSUES) =================
+# ================= JSON FILE DATABASE (NO LOCK ISSUES) =================
 class Database:
-    def __init__(self, db_file: str):
-        self.db_file = db_file
-        self._create_tables()
+    def __init__(self, data_file: str):
+        self.data_file = data_file
+        self._init_data()
     
-    def _create_tables(self):
-        """Create tables if not exists - called only once"""
-        conn = sqlite3.connect(self.db_file, isolation_level=None)
-        conn.execute("PRAGMA journal_mode=WAL")
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                joined_date TIMESTAMP,
-                balance INTEGER DEFAULT 0,
-                total_earned INTEGER DEFAULT 0,
-                total_withdrawn INTEGER DEFAULT 0,
-                referral_count INTEGER DEFAULT 0,
-                is_admin BOOLEAN DEFAULT 0,
-                is_banned BOOLEAN DEFAULT 0
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS withdrawals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                amount INTEGER,
-                upi_id TEXT,
-                status TEXT DEFAULT 'pending',
-                request_date TIMESTAMP
-            )
-        ''')
-        
-        # Add admin
-        for admin_id in ADMIN_IDS:
-            cursor.execute('''
-                INSERT OR IGNORE INTO users (user_id, is_admin, joined_date, balance)
-                VALUES (?, 1, ?, 0)
-            ''', (admin_id, datetime.now()))
-        
-        conn.commit()
-        conn.close()
-        logger.info("Database tables created")
+    def _init_data(self):
+        """Initialize data file if not exists"""
+        if not os.path.exists(self.data_file):
+            data = {
+                "users": {},
+                "withdrawals": {},
+                "next_withdrawal_id": 1
+            }
+            # Add admins
+            for admin_id in ADMIN_IDS:
+                data["users"][str(admin_id)] = {
+                    "user_id": admin_id,
+                    "username": None,
+                    "first_name": "Admin",
+                    "last_name": "",
+                    "joined_date": datetime.now().isoformat(),
+                    "balance": 0,
+                    "total_earned": 0,
+                    "total_withdrawn": 0,
+                    "referral_count": 0,
+                    "is_admin": True,
+                    "is_banned": False
+                }
+            self._save_data(data)
     
-    def _query(self, query, params=(), fetch_one=False, fetch_all=False):
-        """Simple query executor with auto-commit"""
-        conn = None
+    def _load_data(self):
+        """Load data from JSON file"""
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            conn.execute("PRAGMA journal_mode=WAL")
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            
-            if fetch_one:
-                result = cursor.fetchone()
-                conn.commit()
-                return result
-            elif fetch_all:
-                result = cursor.fetchall()
-                conn.commit()
-                return result
-            else:
-                conn.commit()
-                return cursor.lastrowid if query.strip().upper().startswith('INSERT') else None
-        except Exception as e:
-            logger.error(f"Database error: {e}")
-            return None
-        finally:
-            if conn:
-                conn.close()
+            with open(self.data_file, 'r') as f:
+                return json.load(f)
+        except:
+            return {"users": {}, "withdrawals": {}, "next_withdrawal_id": 1}
+    
+    def _save_data(self, data):
+        """Save data to JSON file"""
+        with open(self.data_file, 'w') as f:
+            json.dump(data, f, indent=2)
     
     def add_user(self, user_id: int, username: str, first_name: str, last_name: str = "", referred_by: int = None):
-        # Check if user exists
-        existing = self._query("SELECT user_id FROM users WHERE user_id = ?", (user_id,), fetch_one=True)
+        data = self._load_data()
+        user_id_str = str(user_id)
         
-        if not existing:
+        if user_id_str not in data["users"]:
             # Add new user
-            self._query('''
-                INSERT INTO users (user_id, username, first_name, last_name, joined_date, balance)
-                VALUES (?, ?, ?, ?, ?, 0)
-            ''', (user_id, username, first_name, last_name, datetime.now()))
+            data["users"][user_id_str] = {
+                "user_id": user_id,
+                "username": username,
+                "first_name": first_name,
+                "last_name": last_name,
+                "joined_date": datetime.now().isoformat(),
+                "balance": 0,
+                "total_earned": 0,
+                "total_withdrawn": 0,
+                "referral_count": 0,
+                "is_admin": user_id in ADMIN_IDS,
+                "is_banned": False
+            }
             
             # Add referral bonus
-            if referred_by and referred_by != user_id:
-                self.add_balance(referred_by, REFERRAL_BONUS)
-                self._query("UPDATE users SET referral_count = referral_count + 1 WHERE user_id = ?", (referred_by,))
-        
+            if referred_by and referred_by != user_id and str(referred_by) in data["users"]:
+                data["users"][str(referred_by)]["balance"] += REFERRAL_BONUS
+                data["users"][str(referred_by)]["total_earned"] += REFERRAL_BONUS
+                data["users"][str(referred_by)]["referral_count"] += 1
+            
+            self._save_data(data)
         return True
     
     def get_balance(self, user_id: int) -> int:
-        result = self._query("SELECT balance FROM users WHERE user_id = ?", (user_id,), fetch_one=True)
-        return result[0] if result else 0
+        data = self._load_data()
+        user = data["users"].get(str(user_id))
+        return user["balance"] if user else 0
     
-    def add_balance(self, user_id: int, amount: int):
-        self._query("UPDATE users SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?", 
-                   (amount, amount, user_id))
+    def get_user_stats(self, user_id: int):
+        data = self._load_data()
+        user = data["users"].get(str(user_id))
+        if user:
+            return {
+                'balance': user['balance'],
+                'total_earned': user['total_earned'],
+                'total_withdrawn': user['total_withdrawn'],
+                'referral_count': user['referral_count'],
+                'joined_date': user['joined_date'][:10]
+            }
+        return {'balance': 0, 'total_earned': 0, 'total_withdrawn': 0, 'referral_count': 0, 'joined_date': datetime.now().isoformat()[:10]}
     
     def deduct_balance(self, user_id: int, amount: int) -> bool:
-        balance = self.get_balance(user_id)
-        if balance >= amount:
-            self._query("UPDATE users SET balance = balance - ?, total_withdrawn = total_withdrawn + ? WHERE user_id = ?", 
-                       (amount, amount, user_id))
+        data = self._load_data()
+        user_id_str = str(user_id)
+        
+        if user_id_str in data["users"] and data["users"][user_id_str]["balance"] >= amount:
+            data["users"][user_id_str]["balance"] -= amount
+            data["users"][user_id_str]["total_withdrawn"] += amount
+            self._save_data(data)
             return True
         return False
     
     def create_withdrawal(self, user_id: int, amount: int, upi_id: str) -> int:
-        return self._query('''
-            INSERT INTO withdrawals (user_id, amount, upi_id, request_date)
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, amount, upi_id, datetime.now()))
+        data = self._load_data()
+        wd_id = data["next_withdrawal_id"]
+        data["next_withdrawal_id"] += 1
+        
+        data["withdrawals"][str(wd_id)] = {
+            "id": wd_id,
+            "user_id": user_id,
+            "amount": amount,
+            "upi_id": upi_id,
+            "status": "pending",
+            "request_date": datetime.now().isoformat()
+        }
+        self._save_data(data)
+        return wd_id
     
     def get_pending_withdrawals(self):
-        return self._query('''
-            SELECT w.id, w.user_id, w.amount, w.upi_id, w.status, w.request_date,
-                   u.first_name, u.username
-            FROM withdrawals w
-            JOIN users u ON w.user_id = u.user_id
-            WHERE w.status = 'pending'
-            ORDER BY w.request_date ASC
-        ''', fetch_all=True) or []
+        data = self._load_data()
+        pending = []
+        for wd_id, wd in data["withdrawals"].items():
+            if wd["status"] == "pending":
+                user = data["users"].get(str(wd["user_id"]), {})
+                pending.append({
+                    "id": wd["id"],
+                    "user_id": wd["user_id"],
+                    "amount": wd["amount"],
+                    "upi_id": wd["upi_id"],
+                    "first_name": user.get("first_name", "Unknown"),
+                    "username": user.get("username", ""),
+                    "request_date": wd["request_date"]
+                })
+        return pending
     
     def approve_withdrawal(self, withdraw_id: int):
-        self._query("UPDATE withdrawals SET status = 'approved' WHERE id = ?", (withdraw_id,))
+        data = self._load_data()
+        if str(withdraw_id) in data["withdrawals"]:
+            data["withdrawals"][str(withdraw_id)]["status"] = "approved"
+            self._save_data(data)
     
-    def reject_withdrawal(self, withdraw_id: int, user_id: int, amount: int):
-        self._query("UPDATE withdrawals SET status = 'rejected' WHERE id = ?", (withdraw_id,))
-        self.add_balance(user_id, amount)  # Refund
-    
-    def get_user_stats(self, user_id: int):
-        result = self._query('''
-            SELECT balance, total_earned, total_withdrawn, referral_count, joined_date
-            FROM users WHERE user_id = ?
-        ''', (user_id,), fetch_one=True)
-        
-        if result:
-            return {
-                'balance': result[0],
-                'total_earned': result[1],
-                'total_withdrawn': result[2],
-                'referral_count': result[3],
-                'joined_date': result[4]
-            }
-        return {'balance': 0, 'total_earned': 0, 'total_withdrawn': 0, 'referral_count': 0, 'joined_date': datetime.now()}
+    def reject_withdrawal(self, withdraw_id: int):
+        data = self._load_data()
+        if str(withdraw_id) in data["withdrawals"]:
+            wd = data["withdrawals"][str(withdraw_id)]
+            wd["status"] = "rejected"
+            # Refund amount
+            if str(wd["user_id"]) in data["users"]:
+                data["users"][str(wd["user_id"])]["balance"] += wd["amount"]
+            self._save_data(data)
     
     def is_admin(self, user_id: int) -> bool:
-        result = self._query("SELECT is_admin FROM users WHERE user_id = ?", (user_id,), fetch_one=True)
-        return result[0] == 1 if result else False
+        data = self._load_data()
+        user = data["users"].get(str(user_id))
+        return user.get("is_admin", False) if user else False
     
     def is_banned(self, user_id: int) -> bool:
-        result = self._query("SELECT is_banned FROM users WHERE user_id = ?", (user_id,), fetch_one=True)
-        return result[0] == 1 if result else False
+        data = self._load_data()
+        user = data["users"].get(str(user_id))
+        return user.get("is_banned", False) if user else False
     
     def get_all_users(self):
-        return self._query("SELECT user_id FROM users WHERE is_banned = 0", fetch_all=True) or []
+        data = self._load_data()
+        return [(int(uid), user.get("first_name", "")) for uid, user in data["users"].items() if not user.get("is_banned", False)]
 
 # ================= STATES =================
 class WithdrawState(StatesGroup):
@@ -210,11 +214,11 @@ def get_main_keyboard(is_admin: bool = False):
     
     return keyboard
 
-# ================= HANDLERS =================
+# ================= COMMANDS =================
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     user = message.from_user
-    db = Database(DATABASE_FILE)
+    db = Database(DATA_FILE)
     
     if db.is_banned(user.id):
         await message.answer("❌ You are banned!")
@@ -242,7 +246,7 @@ async def start_cmd(message: types.Message):
 @dp.callback_query(lambda c: c.data == "balance")
 async def balance_cmd(callback: types.CallbackQuery):
     await callback.answer()
-    db = Database(DATABASE_FILE)
+    db = Database(DATA_FILE)
     stats = db.get_user_stats(callback.from_user.id)
     
     text = f"""💳 Your Balance
@@ -259,7 +263,7 @@ Earn ₹{REFERRAL_BONUS}/referral!"""
 @dp.callback_query(lambda c: c.data == "stats")
 async def stats_cmd(callback: types.CallbackQuery):
     await callback.answer()
-    db = Database(DATABASE_FILE)
+    db = Database(DATA_FILE)
     stats = db.get_user_stats(callback.from_user.id)
     
     text = f"""📊 Your Stats
@@ -267,7 +271,7 @@ async def stats_cmd(callback: types.CallbackQuery):
 💰 Balance: ₹{stats['balance']}
 📈 Earned: ₹{stats['total_earned']}
 👥 Referrals: {stats['referral_count']}
-📅 Joined: {str(stats['joined_date'])[:10]}"""
+📅 Joined: {stats['joined_date']}"""
     
     await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
@@ -276,7 +280,7 @@ async def referral_cmd(callback: types.CallbackQuery):
     await callback.answer()
     bot_user = await bot.get_me()
     link = f"https://t.me/{bot_user.username}?start={callback.from_user.id}"
-    db = Database(DATABASE_FILE)
+    db = Database(DATA_FILE)
     stats = db.get_user_stats(callback.from_user.id)
     
     text = f"""💰 Refer & Earn
@@ -300,7 +304,7 @@ async def referral_cmd(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "withdraw")
 async def withdraw_cmd(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    db = Database(DATABASE_FILE)
+    db = Database(DATA_FILE)
     balance = db.get_balance(callback.from_user.id)
     
     if balance < MINIMUM_WITHDRAWAL:
@@ -319,7 +323,7 @@ async def withdraw_amount(msg: types.Message, state: FSMContext):
     
     try:
         amount = int(msg.text)
-        db = Database(DATABASE_FILE)
+        db = Database(DATA_FILE)
         balance = db.get_balance(msg.from_user.id)
         
         if amount < MINIMUM_WITHDRAWAL:
@@ -349,7 +353,7 @@ async def withdraw_upi(msg: types.Message, state: FSMContext):
     
     data = await state.get_data()
     amount = data['amount']
-    db = Database(DATABASE_FILE)
+    db = Database(DATA_FILE)
     
     if db.deduct_balance(msg.from_user.id, amount):
         wd_id = db.create_withdrawal(msg.from_user.id, amount, upi_id)
@@ -399,7 +403,7 @@ async def help_cmd(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "back")
 async def back_cmd(callback: types.CallbackQuery):
     await callback.answer()
-    db = Database(DATABASE_FILE)
+    db = Database(DATA_FILE)
     balance = db.get_balance(callback.from_user.id)
     await callback.message.edit_text(f"🌟 Main Menu\n\n💰 Balance: ₹{balance}", 
                                      reply_markup=get_main_keyboard(), parse_mode="Markdown")
@@ -408,7 +412,7 @@ async def back_cmd(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "admin_panel")
 async def admin_panel(callback: types.CallbackQuery):
     await callback.answer()
-    db = Database(DATABASE_FILE)
+    db = Database(DATA_FILE)
     if not db.is_admin(callback.from_user.id):
         await callback.answer("❌ Admin only!", show_alert=True)
         return
@@ -424,7 +428,7 @@ async def admin_panel(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "admin_wd")
 async def admin_withdrawals(callback: types.CallbackQuery):
     await callback.answer()
-    db = Database(DATABASE_FILE)
+    db = Database(DATA_FILE)
     if not db.is_admin(callback.from_user.id):
         return
     
@@ -435,9 +439,9 @@ async def admin_withdrawals(callback: types.CallbackQuery):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     for w in withdrawals:
-        name = w[6] if w[6] else f"User_{w[1]}"
+        name = w.get("first_name", f"User_{w['user_id']}")
         keyboard.inline_keyboard.append([
-            InlineKeyboardButton(text=f"💰 {name[:12]} - ₹{w[2]}", callback_data=f"process_{w[0]}")
+            InlineKeyboardButton(text=f"💰 {name[:12]} - ₹{w['amount']}", callback_data=f"process_{w['id']}")
         ])
     keyboard.inline_keyboard.append([InlineKeyboardButton(text="◀️ Back", callback_data="admin_panel")])
     
@@ -447,10 +451,10 @@ async def admin_withdrawals(callback: types.CallbackQuery):
 async def process_wd(callback: types.CallbackQuery):
     await callback.answer()
     wd_id = int(callback.data.split("_")[1])
-    db = Database(DATABASE_FILE)
+    db = Database(DATA_FILE)
     
     withdrawals = db.get_pending_withdrawals()
-    w = next((x for x in withdrawals if x[0] == wd_id), None)
+    w = next((x for x in withdrawals if x["id"] == wd_id), None)
     
     if not w:
         await callback.message.answer("Not found!")
@@ -462,19 +466,19 @@ async def process_wd(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="◀️ Back", callback_data="admin_wd")]
     ])
     
-    text = f"""💰 Withdrawal #{w[0]}
+    text = f"""💰 Withdrawal #{w['id']}
 
-👤 {w[6]} @{w[7] or 'N/A'}
-💰 ₹{w[2]}
-📱 {w[3]}
-📅 {w[5][:16]}"""
+👤 {w['first_name']} @{w['username'] or 'N/A'}
+💰 ₹{w['amount']}
+📱 {w['upi_id']}
+📅 {w['request_date'][:16]}"""
     
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
 @dp.callback_query(lambda c: c.data.startswith("approve_"))
 async def approve_wd(callback: types.CallbackQuery):
     wd_id = int(callback.data.split("_")[1])
-    db = Database(DATABASE_FILE)
+    db = Database(DATA_FILE)
     db.approve_withdrawal(wd_id)
     await callback.answer("✅ Approved!", show_alert=True)
     await callback.message.edit_text("✅ Approved!")
@@ -484,17 +488,8 @@ async def approve_wd(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("reject_"))
 async def reject_wd(callback: types.CallbackQuery):
     wd_id = int(callback.data.split("_")[1])
-    db = Database(DATABASE_FILE)
-    
-    # Get user and amount
-    result = db._query("SELECT user_id, amount FROM withdrawals WHERE id = ?", (wd_id,), fetch_one=True)
-    if result:
-        user_id, amount = result
-        db.reject_withdrawal(wd_id, user_id, amount)
-        try:
-            await bot.send_message(user_id, f"❌ Withdrawal ₹{amount} rejected. Refunded.")
-        except:
-            pass
+    db = Database(DATA_FILE)
+    db.reject_withdrawal(wd_id)
     
     await callback.answer("❌ Rejected!", show_alert=True)
     await callback.message.edit_text("❌ Rejected!")
@@ -504,7 +499,7 @@ async def reject_wd(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "admin_bc")
 async def admin_broadcast_panel(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    db = Database(DATABASE_FILE)
+    db = Database(DATA_FILE)
     if not db.is_admin(callback.from_user.id):
         return
     
@@ -518,15 +513,15 @@ async def process_broadcast(msg: types.Message, state: FSMContext):
         await start_cmd(msg)
         return
     
-    db = Database(DATABASE_FILE)
+    db = Database(DATA_FILE)
     users = db.get_all_users()
     
     sent = 0
     status = await msg.answer("⏳ Broadcasting...")
     
-    for user in users:
+    for user_id, name in users:
         try:
-            await bot.send_message(user[0], msg.text)
+            await bot.send_message(user_id, msg.text)
             sent += 1
             await asyncio.sleep(0.05)
         except:
@@ -539,20 +534,12 @@ async def process_broadcast(msg: types.Message, state: FSMContext):
 async def main():
     logger.info("🚀 Starting bot...")
     
-    # Remove old database to fix lock issues
-    if os.path.exists(DATABASE_FILE):
-        try:
-            os.remove(DATABASE_FILE)
-            logger.info("Old database removed")
-        except:
-            pass
+    # Clear webhook first
+    await bot.delete_webhook(drop_pending_updates=True)
     
     # Initialize database
-    db = Database(DATABASE_FILE)
-    logger.info("Database ready")
-    
-    # Clear webhook
-    await bot.delete_webhook(drop_pending_updates=True)
+    db = Database(DATA_FILE)
+    logger.info("Bot ready!")
     
     # Start polling
     await dp.start_polling(bot)
