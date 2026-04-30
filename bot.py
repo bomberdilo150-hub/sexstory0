@@ -52,7 +52,7 @@ class StoryFetcher:
                 # Try multiple endpoints for stories
                 endpoints = [
                     WEBSITE_URL,
-                    f"{WEBSITE_URL}/stories",
+                    f"{WEBSITE_URL}/story",
                     f"{WEBSITE_URL}/all-stories",
                     f"{WEBSITE_URL}/category/all",
                     f"{WEBSITE_URL}/posts",
