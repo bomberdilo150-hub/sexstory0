@@ -12,6 +12,7 @@ import os
 import re
 import aiohttp
 from bs4 import BeautifulSoup
+import json
 
 # ================= CONFIG =================
 API_TOKEN = "8777177819:AAHuJtPJR8VmoWSfqHtrHW7WeVNWJ6sbV7o"
@@ -36,118 +37,153 @@ class StoryFetcher:
     def __init__(self):
         self.stories_cache = {}
         self.last_fetch = None
+        self.base_url = WEBSITE_URL.rstrip('/')
+    
+    async def fetch_page_links(self, session, url):
+        """Fetch and extract all links from a page"""
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+        }
+        
+        try:
+            async with session.get(url, headers=headers, timeout=15) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'html.parser')
+                    
+                    links = []
+                    # Find all links
+                    for link in soup.find_all('a', href=True):
+                        href = link.get('href', '')
+                        text = link.get_text(strip=True)
+                        links.append({
+                            'href': href,
+                            'text': text
+                        })
+                    
+                    # Also check for script tags that might contain story data
+                    scripts = soup.find_all('script')
+                    for script in scripts:
+                        if script.string:
+                            # Look for story URLs in JavaScript
+                            urls = re.findall(r'["\'](/story/[a-zA-Z0-9\-]+)["\']', script.string)
+                            for url in urls:
+                                links.append({
+                                    'href': url,
+                                    'text': ''
+                                })
+                    
+                    return links
+        except Exception as e:
+            logger.error(f"Error fetching {url}: {e}")
+            return []
     
     async def fetch_stories_from_website(self):
-        """Fetch stories directly from website"""
+        """Fetch stories from the website"""
         stories = []
         
         try:
             async with aiohttp.ClientSession() as session:
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.5',
-                }
-                
-                # Try multiple endpoints for stories
-                endpoints = [
-                    WEBSITE_URL,
-                    f"{WEBSITE_URL}/story",
-                    f"{WEBSITE_URL}/all-stories",
-                    f"{WEBSITE_URL}/category/all",
-                    f"{WEBSITE_URL}/posts",
-                    f"{WEBSITE_URL}/blog"
+                # Try multiple pages to find stories
+                urls_to_check = [
+                    self.base_url,
+                    f"{self.base_url}/stories",
+                    f"{self.base_url}/explore",
+                    f"{self.base_url}/category/all",
+                    f"{self.base_url}/home",
+                    f"{self.base_url}/browse",
                 ]
                 
-                for endpoint in endpoints:
+                all_links = []
+                for url in urls_to_check:
+                    logger.info(f"Checking: {url}")
+                    links = await self.fetch_page_links(session, url)
+                    all_links.extend(links)
+                
+                # Filter story links
+                story_urls = set()
+                for link in all_links:
+                    href = link['href']
+                    if '/story/' in href:
+                        full_url = href if href.startswith('http') else self.base_url + href
+                        story_urls.add(full_url)
+                
+                logger.info(f"Found {len(story_urls)} unique story URLs")
+                
+                # If no stories found via scraping, use the known story URL
+                if not story_urls:
+                    logger.info("No stories found via scraping, using known story URLs")
+                    known_stories = [
+                        f"{self.base_url}/story/268a9216-a142-49b7-91d3-6f0c911218e5",
+                    ]
+                    story_urls.update(known_stories)
+                
+                # Create story objects
+                for i, url in enumerate(story_urls, 1):
+                    story_id = abs(hash(url)) % 100000
+                    
+                    # Try to get a title from the URL
+                    url_parts = url.split('/')
+                    last_part = url_parts[-1] if url_parts else ''
+                    
+                    # Generate a readable title
+                    if last_part and len(last_part) > 10:
+                        title = f"Story {i}"
+                    else:
+                        title = f"Story {i}"
+                    
+                    stories.append({
+                        'id': story_id,
+                        'title': title,
+                        'url': url,
+                        'snippet': 'Click to read this exciting story on our website...'
+                    })
+                
+                # Also try API endpoints
+                api_endpoints = [
+                    f"{self.base_url}/api/stories",
+                    f"{self.base_url}/api/posts",
+                    f"{self.base_url}/api/stories/list",
+                ]
+                
+                for api_url in api_endpoints:
                     try:
-                        logger.info(f"Fetching from: {endpoint}")
-                        async with session.get(endpoint, headers=headers, timeout=15) as response:
+                        headers = {
+                            'User-Agent': 'Mozilla/5.0',
+                            'Accept': 'application/json',
+                        }
+                        async with session.get(api_url, headers=headers, timeout=10) as response:
                             if response.status == 200:
-                                html = await response.text()
-                                soup = BeautifulSoup(html, 'html.parser')
-                                
-                                # Strategy 1: Look for article/story containers
-                                story_containers = soup.find_all(['article', 'div', 'section'], 
-                                    class_=re.compile(r'story|post|article|card|content-item|entry', re.I))
-                                
-                                for container in story_containers:
-                                    # Find links within container
-                                    links = container.find_all('a', href=True)
-                                    for link in links:
-                                        href = link.get('href', '')
-                                        title = link.get_text(strip=True)
-                                        
-                                        # Also check for title elements
-                                        if not title:
-                                            title_elem = link.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p'])
-                                            if title_elem:
-                                                title = title_elem.get_text(strip=True)
-                                        
-                                        if title and len(title) > 5 and len(title) < 200:
-                                            full_url = href if href.startswith('http') else WEBSITE_URL.rstrip('/') + href
-                                            story_id = abs(hash(full_url)) % 100000
-                                            
-                                            # Try to find description
-                                            desc_elem = container.find(['p', 'span', 'div'], 
-                                                class_=re.compile(r'desc|excerpt|summary|content', re.I))
-                                            snippet = desc_elem.get_text(strip=True)[:150] if desc_elem else 'Click to read full story...'
-                                            
-                                            stories.append({
-                                                'id': story_id,
-                                                'title': title.strip()[:80],
-                                                'url': full_url,
-                                                'snippet': snippet
-                                            })
-                                
-                                # Strategy 2: Find all story links directly
-                                all_links = soup.find_all('a', href=True)
-                                for link in all_links:
-                                    href = link.get('href', '')
-                                    text = link.get_text(strip=True)
-                                    
-                                    # Look for story-like URLs
-                                    if re.search(r'/(story|post|read|article|blog)/', href, re.I):
-                                        if text and len(text) > 5 and len(text) < 200:
-                                            full_url = href if href.startswith('http') else WEBSITE_URL.rstrip('/') + href
-                                            story_id = abs(hash(full_url)) % 100000
-                                            
-                                            if not any(s['url'] == full_url for s in stories):
-                                                stories.append({
-                                                    'id': story_id,
-                                                    'title': text.strip()[:80],
-                                                    'url': full_url,
-                                                    'snippet': 'Click to read full story...'
-                                                })
-                                
-                                # Strategy 3: Find heading elements with links
-                                headings = soup.find_all(['h1', 'h2', 'h3', 'h4'])
-                                for heading in headings:
-                                    link = heading.find('a', href=True)
-                                    if link:
-                                        href = link.get('href', '')
-                                        text = heading.get_text(strip=True)
-                                        if text and len(text) > 10 and len(text) < 200:
-                                            full_url = href if href.startswith('http') else WEBSITE_URL.rstrip('/') + href
-                                            story_id = abs(hash(full_url)) % 100000
-                                            
-                                            if not any(s['url'] == full_url for s in stories):
-                                                stories.append({
-                                                    'id': story_id,
-                                                    'title': text.strip()[:80],
-                                                    'url': full_url,
-                                                    'snippet': 'Click to read full story...'
-                                                })
-                                
-                                if len(stories) > 5:
-                                    logger.info(f"Found {len(stories)} stories from {endpoint}")
-                                    break
-                                    
-                    except Exception as e:
-                        logger.warning(f"Failed to fetch from {endpoint}: {e}")
+                                try:
+                                    data = await response.json()
+                                    if isinstance(data, list):
+                                        for item in data:
+                                            if isinstance(item, dict):
+                                                story_id = item.get('id') or item.get('slug')
+                                                title = item.get('title', '')
+                                                story_url = item.get('url', '')
+                                                
+                                                if not story_url and story_id:
+                                                    story_url = f"{self.base_url}/story/{story_id}"
+                                                
+                                                if story_url and title:
+                                                    full_url = story_url if story_url.startswith('http') else self.base_url + story_url
+                                                    stories.append({
+                                                        'id': abs(hash(full_url)) % 100000,
+                                                        'title': title[:80],
+                                                        'url': full_url,
+                                                        'snippet': item.get('description', item.get('excerpt', 'Click to read...'))[:150]
+                                                    })
+                                    if stories:
+                                        break
+                                except:
+                                    pass
+                    except:
                         continue
                 
-                # If stories found, cache them
+                # Cache stories
                 if stories:
                     # Remove duplicates
                     seen_urls = set()
@@ -157,26 +193,24 @@ class StoryFetcher:
                             seen_urls.add(story['url'])
                             unique_stories.append(story)
                     
-                    # Cache stories by ID
                     self.stories_cache = {}
                     for story in unique_stories[:50]:
                         self.stories_cache[story['id']] = story
                     
                     self.last_fetch = datetime.now()
-                    logger.info(f"Successfully fetched and cached {len(unique_stories)} stories")
+                    logger.info(f"Cached {len(unique_stories)} stories")
                     return list(self.stories_cache.values())
                 
         except Exception as e:
             logger.error(f"Story fetch error: {e}")
         
-        # If no stories found and no cache, return empty
-        if not self.stories_cache:
-            logger.warning("No stories found and no cache available")
-            return []
-        
         # Return cached stories if available
-        logger.info("Returning cached stories")
-        return list(self.stories_cache.values())
+        if self.stories_cache:
+            logger.info("Returning cached stories")
+            return list(self.stories_cache.values())
+        
+        logger.warning("No stories found and no cache available")
+        return []
     
     async def get_stories(self, force_refresh=False, page=1, per_page=5):
         """Get stories with pagination"""
@@ -197,7 +231,6 @@ class StoryFetcher:
             total = len(stories_list)
             total_pages = max(1, (total + per_page - 1) // per_page)
             
-            # Adjust page if out of bounds
             if page < 1:
                 page = 1
             elif page > total_pages:
@@ -361,7 +394,6 @@ class Database:
         if result:
             stories_today, last_date = result
             
-            # Reset counter if new day
             if last_date != today:
                 cursor.execute("""
                     UPDATE users SET stories_read_today = 0, last_story_date = ?
@@ -411,7 +443,6 @@ class Database:
             """, (user_id, story_id, story_title, datetime.now()))
             
             if cursor.rowcount > 0:
-                # Only reward if story wasn't completed before
                 if self.can_reward_story(user_id):
                     self.record_story_read(user_id, story_id, rewarded=True)
                     conn.commit()
@@ -688,17 +719,21 @@ async def start_cmd(message: types.Message):
 👥 Refer friends - ₹{REFERRAL_BONUS}/referral
 💳 Min withdrawal: ₹{MINIMUM_WITHDRAWAL}
 
+📱 Click 'Open Stories App' to browse all stories!
+📚 Or click 'Browse Stories' to see available stories
+
 Start reading now! 👇"""
     
     await message.answer(text, reply_markup=get_main_keyboard(db.is_admin(user.id)), parse_mode="Markdown")
 
 @dp.callback_query(lambda c: c.data == "stories_list")
 async def stories_list(callback: types.CallbackQuery):
-    await callback.answer("📚 Fetching latest stories from website...")
+    await callback.answer("📚 Fetching latest stories...")
     
     # Show loading message
     loading_msg = await callback.message.edit_text(
-        "🔄 *Fetching stories from website...*\nPlease wait...",
+        "🔄 *Fetching stories from website...*\n"
+        "This may take a moment...",
         parse_mode="Markdown"
     )
     
@@ -707,20 +742,32 @@ async def stories_list(callback: types.CallbackQuery):
     if story_data['stories']:
         stories_today = Database(DATABASE_FILE).get_stories_read_today(callback.from_user.id)
         
+        # Update story titles to be more descriptive
+        for i, story in enumerate(story_data['stories'], 1):
+            if story['title'].startswith('Story '):
+                story['title'] = f"Story #{i} - Click to Read"
+        
         await loading_msg.edit_text(
-            f"📚 *Latest Stories*\n"
+            f"📚 *Available Stories*\n"
             f"📖 Read today: {stories_today}/{DAILY_STORY_LIMIT}\n"
             f"🎁 Reward: ₹{STORY_READ_REWARD}/story\n"
-            f"📊 Total stories: {story_data['total']}",
+            f"📊 Total stories: {story_data['total']}\n\n"
+            f"💡 Click on a story to view details\n"
+            f"🌐 Use 'Read on Web' to open the story\n"
+            f"✅ Click 'Complete' after reading",
             reply_markup=get_stories_keyboard(story_data, 1),
             parse_mode="Markdown"
         )
     else:
         await loading_msg.edit_text(
-            "❌ *No stories found on website!*\n\n"
-            "Please try again later or contact admin.\n"
-            "The website might be temporarily unavailable.",
+            "⚠️ *No stories could be fetched!*\n\n"
+            "The website might be temporarily unavailable.\n\n"
+            "*Try these options:*\n"
+            "📱 Open the Web App directly\n"
+            "🔄 Try refreshing later\n"
+            "👑 Contact admin if issue persists",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📱 Open Web App", web_app=WebAppInfo(url=WEBSITE_URL))],
                 [InlineKeyboardButton(text="🔄 Try Again", callback_data="stories_list")],
                 [InlineKeyboardButton(text="◀️ Back to Menu", callback_data="back")]
             ]),
@@ -768,12 +815,12 @@ async def read_story(callback: types.CallbackQuery):
 {story.get('snippet', 'An exciting story awaits!')}
 
 *How to complete:*
-1. Click 'Read on Web' to open story
-2. Read the full story
-3. Click '✅ Complete' when done
+1. Click 'Read on Web' to open the full story
+2. Read the complete story on the website
+3. Come back and click '✅ Complete'
 4. Earn ₹{STORY_READ_REWARD} reward!
 
-💡 Make sure to read the complete story before marking it done."""
+💡 The story opens in your browser or Telegram's built-in browser"""
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🌐 Read Full Story", url=story['url'])],
@@ -837,7 +884,12 @@ async def my_stories(callback: types.CallbackQuery):
         
         text += f"💰 Total Earned: ₹{len(completed) * STORY_READ_REWARD}"
     else:
-        text = "📚 *No stories completed yet!*\n\nStart reading to earn rewards!"
+        text = "📚 *No stories completed yet!*\n\nStart reading to earn rewards!\n\n"
+        text += "💡 *How to earn:*\n"
+        text += "1. Browse available stories\n"
+        text += "2. Read the full story\n"
+        text += "3. Mark as complete\n"
+        text += f"4. Earn ₹{STORY_READ_REWARD} per story!"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📖 Browse Stories", callback_data="stories_list")],
@@ -1021,6 +1073,13 @@ async def help_cmd(callback: types.CallbackQuery):
 👥 Referrals: ₹{REFERRAL_BONUS}/referral
 📊 Daily limit: {DAILY_STORY_LIMIT} stories
 
+*How to read stories:*
+1. Click 'Browse Stories'
+2. Select a story
+3. Click 'Read on Web'
+4. Read the complete story
+5. Click 'Complete' to earn
+
 *Withdrawal:*
 💳 Min: ₹{MINIMUM_WITHDRAWAL}
 📱 UPI transfer
@@ -1039,7 +1098,10 @@ async def back_cmd(callback: types.CallbackQuery):
     balance = db.get_balance(callback.from_user.id)
     
     await callback.message.edit_text(
-        f"🌟 *Main Menu*\n\n💰 Balance: ₹{balance}",
+        f"🌟 *Main Menu*\n\n"
+        f"💰 Balance: ₹{balance}\n\n"
+        f"📱 Use 'Open Stories App' to browse all stories\n"
+        f"📚 Use 'Browse Stories' to see available stories",
         reply_markup=get_main_keyboard(db.is_admin(callback.from_user.id)),
         parse_mode="Markdown"
     )
@@ -1079,7 +1141,7 @@ async def admin_refresh_stories(callback: types.CallbackQuery):
     if story_data['stories']:
         await callback.message.answer(f"✅ Refreshed {story_data['total']} stories from website!")
     else:
-        await callback.message.answer("❌ Failed to fetch stories!")
+        await callback.message.answer("❌ Failed to fetch stories! Website might be down or no stories available.")
     
     await admin_panel_cmd(callback)
 
