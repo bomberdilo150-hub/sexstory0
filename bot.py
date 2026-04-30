@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 import json
 
 # ================= CONFIG =================
-API_TOKEN = "PUT_YOUR_TOKEN_HERE"
+API_TOKEN = "8777177819:AAHuJtPJR8VmoWSfqHtrHW7WeVNWJ6sbV7o"
 WEBSITE_URL = "https://sexstory.lovable.app"
 STORY_PAGE_URL = "https://sexstory.lovable.app/story/"
 DATABASE_FILE = "bot_database.db"
