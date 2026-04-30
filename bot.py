@@ -4,7 +4,7 @@ from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.markdown import escape_md
+from aiogram.utils.text_decorations import markdown_decoration
 
 import asyncio
 import logging
@@ -36,6 +36,11 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+
+# Helper function for markdown escaping
+def escape_md(text: str) -> str:
+    """Escape markdown special characters"""
+    return markdown_decoration.quote(text)
 
 # ================= DATABASE =================
 class Database:
