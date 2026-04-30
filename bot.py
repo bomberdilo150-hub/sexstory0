@@ -12,6 +12,7 @@ import os
 import re
 import aiohttp
 from bs4 import BeautifulSoup
+import json
 
 # ================= CONFIG =================
 API_TOKEN = "8777177819:AAHuJtPJR8VmoWSfqHtrHW7WeVNWJ6sbV7o"
@@ -53,6 +54,7 @@ class StoryFetcher:
                     'Accept-Encoding': 'gzip, deflate, br',
                     'Connection': 'keep-alive',
                     'Upgrade-Insecure-Requests': '1',
+                    'Cache-Control': 'max-age=0',
                 }
                 
                 logger.info(f"🔍 Fetching stories from: {self.story_page_url}")
@@ -60,83 +62,62 @@ class StoryFetcher:
                 async with session.get(self.story_page_url, headers=headers, timeout=30) as response:
                     if response.status == 200:
                         html = await response.text()
+                        
+                        # Save HTML for debugging
+                        with open('story_page_debug.html', 'w', encoding='utf-8') as f:
+                            f.write(html)
+                        logger.info("📄 Saved HTML to story_page_debug.html for debugging")
+                        
                         soup = BeautifulSoup(html, 'html.parser')
                         
-                        # Log page info for debugging
-                        page_text = soup.get_text()
-                        logger.info(f"📄 Page length: {len(html)} characters")
-                        logger.info(f"📝 Text length: {len(page_text)} characters")
-                        
-                        # Strategy 1: Find all links with UUID pattern in /story/
+                        # Log all links found
                         all_links = soup.find_all('a', href=True)
                         logger.info(f"🔗 Total links found: {len(all_links)}")
                         
-                        story_links_found = 0
+                        # Print first 20 links for debugging
+                        for i, link in enumerate(all_links[:20]):
+                            href = link.get('href', '')
+                            text = link.get_text(strip=True)[:50]
+                            logger.info(f"  Link {i+1}: href='{href}' text='{text}'")
                         
+                        # Strategy 1: Find UUID pattern links
                         for link in all_links:
                             href = link.get('href', '').strip()
                             
-                            # Look for /story/ followed by UUID pattern
-                            uuid_pattern = r'/story/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})'
-                            match = re.search(uuid_pattern, href, re.IGNORECASE)
+                            # Check for /story/ with UUID
+                            uuid_match = re.search(r'/story/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', href, re.IGNORECASE)
                             
-                            if match:
+                            if uuid_match:
                                 full_url = href if href.startswith('http') else self.base_url + href
-                                
-                                # Get title from link text
                                 title = link.get_text(strip=True)
                                 
-                                # If no text, check for title attribute
                                 if not title or len(title) < 3:
-                                    title = link.get('title', '').strip()
+                                    title = link.get('title', '').strip() or link.get('aria-label', '').strip()
                                 
-                                # If still no title, check aria-label
-                                if not title or len(title) < 3:
-                                    title = link.get('aria-label', '').strip()
-                                
-                                # Check parent elements for headings
-                                if not title or len(title) < 3:
-                                    parent = link.parent
-                                    if parent:
-                                        heading = parent.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
-                                        if heading:
-                                            title = heading.get_text(strip=True)
-                                
-                                # Check sibling elements
-                                if not title or len(title) < 3:
-                                    parent = link.parent
-                                    if parent:
-                                        next_sibling = parent.find_next_sibling()
-                                        if next_sibling:
-                                            heading = next_sibling.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
-                                            if heading:
-                                                title = heading.get_text(strip=True)
-                                
-                                # Fallback title
                                 if not title or len(title) < 3:
                                     title = f"Story {len(stories) + 1}"
                                 
-                                # Clean the title
-                                title = title.strip()[:80]
-                                
                                 stories.append({
                                     'id': abs(hash(full_url)) % 100000,
-                                    'title': title,
+                                    'title': title[:80],
                                     'url': full_url,
                                     'snippet': 'Click to read this exciting story...'
                                 })
-                                story_links_found += 1
                         
-                        logger.info(f"✅ Found {story_links_found} story links on /story/ page")
+                        logger.info(f"✅ Strategy 1 found {len(stories)} stories")
                         
-                        # Strategy 2: If no stories found, look for any /story/ links
-                        if story_links_found == 0:
-                            logger.info("🔄 Trying strategy 2: all /story/ links...")
+                        # Strategy 2: Look for any /story/ links (even without UUID)
+                        if not stories:
+                            logger.info("Trying Strategy 2: Any /story/ links...")
                             for link in all_links:
                                 href = link.get('href', '').strip()
-                                if '/story/' in href and href != '/story/' and href != '/story':
+                                if '/story/' in href and href.count('/') >= 3:
                                     full_url = href if href.startswith('http') else self.base_url + href
                                     text = link.get_text(strip=True) or f"Story {len(stories) + 1}"
+                                    
+                                    # Skip the main /story/ page itself
+                                    if full_url.rstrip('/') == self.story_page_url.rstrip('/'):
+                                        continue
                                     
                                     stories.append({
                                         'id': abs(hash(full_url)) % 100000,
@@ -144,45 +125,67 @@ class StoryFetcher:
                                         'url': full_url,
                                         'snippet': 'Click to read this exciting story...'
                                     })
-                                    story_links_found += 1
-                            
-                            logger.info(f"✅ Strategy 2 found {story_links_found} stories")
+                            logger.info(f"✅ Strategy 2 found {len(stories)} stories")
                         
-                        # Strategy 3: Check for React/JS rendered content in script tags
-                        if story_links_found == 0:
-                            logger.info("🔄 Trying strategy 3: script tags...")
+                        # Strategy 3: Check script tags for __NEXT_DATA__ or similar
+                        if not stories:
+                            logger.info("Trying Strategy 3: Script tag data...")
                             scripts = soup.find_all('script')
                             for script in scripts:
                                 if script.string:
-                                    # Look for story URLs in JavaScript
-                                    js_stories = re.findall(r'["\'](/story/[a-f0-9\-]+)["\']', script.string)
-                                    for js_story in js_stories:
-                                        if js_story != '/story/' and js_story != '/story':
-                                            full_url = self.base_url + js_story
-                                            if not any(s['url'] == full_url for s in stories):
+                                    # Try to find JSON data
+                                    try:
+                                        # Look for common patterns
+                                        json_patterns = [
+                                            r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
+                                            r'window\.__DATA__\s*=\s*({.*?});',
+                                            r'__NEXT_DATA__\s*=\s*({.*?});',
+                                        ]
+                                        
+                                        for pattern in json_patterns:
+                                            match = re.search(pattern, script.string, re.DOTALL)
+                                            if match:
+                                                try:
+                                                    data = json.loads(match.group(1))
+                                                    self.extract_stories_from_json(data, stories)
+                                                except:
+                                                    pass
+                                        
+                                        # Look for story URLs in JavaScript
+                                        js_urls = re.findall(r'["\']((?:https?:)?//[^"\']*?/story/[^"\']*?)["\']', script.string)
+                                        for url in js_urls:
+                                            if url.startswith('//'):
+                                                url = 'https:' + url
+                                            if url not in [s['url'] for s in stories]:
                                                 stories.append({
-                                                    'id': abs(hash(full_url)) % 100000,
+                                                    'id': abs(hash(url)) % 100000,
                                                     'title': f"Story {len(stories) + 1}",
-                                                    'url': full_url,
+                                                    'url': url,
                                                     'snippet': 'Click to read this exciting story...'
                                                 })
-                                                story_links_found += 1
-                            
-                            logger.info(f"✅ Strategy 3 found {story_links_found} stories")
+                                    except:
+                                        pass
+                            logger.info(f"✅ Strategy 3 found {len(stories)} stories")
                         
                     else:
-                        logger.error(f"❌ Failed to fetch /story/ page. Status: {response.status}")
+                        logger.error(f"❌ HTTP {response.status} from {self.story_page_url}")
         
-        except asyncio.TimeoutError:
-            logger.error("❌ Timeout while fetching /story/ page")
-        except aiohttp.ClientError as e:
-            logger.error(f"❌ Network error: {e}")
         except Exception as e:
-            logger.error(f"❌ Unexpected error: {e}")
+            logger.error(f"❌ Fetch error: {e}")
         
-        # Cache stories if found
+        # If still no stories, add the known story as fallback
+        if not stories:
+            logger.info("Using fallback: Known story URL")
+            known_url = f"{self.base_url}/story/268a9216-a142-49b7-91d3-6f0c911218e5"
+            stories.append({
+                'id': abs(hash(known_url)) % 100000,
+                'title': "Story 1",
+                'url': known_url,
+                'snippet': 'Click to read this exciting story...'
+            })
+        
+        # Cache stories
         if stories:
-            # Remove duplicates based on URL
             seen_urls = set()
             unique_stories = []
             for story in stories:
@@ -190,26 +193,45 @@ class StoryFetcher:
                     seen_urls.add(story['url'])
                     unique_stories.append(story)
             
-            # Update titles to have proper numbering
+            # Update titles
             for i, story in enumerate(unique_stories, 1):
-                if story['title'].startswith('Story '):
+                if story['title'].startswith('Story ') and story['title'][6:].isdigit():
                     story['title'] = f"Story #{i}"
             
             self.stories_cache = {}
-            for story in unique_stories[:50]:  # Keep top 50
+            for story in unique_stories[:50]:
                 self.stories_cache[story['id']] = story
             
             self.last_fetch = datetime.now()
             logger.info(f"💾 Cached {len(unique_stories)} unique stories")
             return list(self.stories_cache.values())
         
-        # Return cached stories if available
-        if self.stories_cache:
-            logger.info("📦 Returning cached stories")
-            return list(self.stories_cache.values())
-        
-        logger.warning("⚠️ No stories found and no cache available")
+        logger.warning("⚠️ No stories found")
         return []
+    
+    def extract_stories_from_json(self, data, stories):
+        """Recursively extract story URLs from JSON data"""
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if key in ['stories', 'posts', 'items', 'articles', 'data']:
+                    if isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, dict):
+                                url = item.get('url') or item.get('slug') or item.get('id') or item.get('link')
+                                title = item.get('title') or item.get('name') or ''
+                                if url and '/story/' in str(url):
+                                    full_url = url if url.startswith('http') else f"{self.base_url}/story/{url}"
+                                    if full_url not in [s['url'] for s in stories]:
+                                        stories.append({
+                                            'id': abs(hash(full_url)) % 100000,
+                                            'title': title[:80] if title else f"Story {len(stories) + 1}",
+                                            'url': full_url,
+                                            'snippet': item.get('description', item.get('excerpt', 'Click to read...'))[:150]
+                                        })
+                self.extract_stories_from_json(value, stories)
+        elif isinstance(data, list):
+            for item in data:
+                self.extract_stories_from_json(item, stories)
     
     async def get_stories(self, force_refresh=False, page=1, per_page=5):
         """Get stories with pagination"""
@@ -255,13 +277,11 @@ class StoryFetcher:
             }
     
     async def get_story_by_id(self, story_id):
-        """Get specific story by ID"""
         try:
             if not self.stories_cache:
                 await self.fetch_stories_from_website()
             return self.stories_cache.get(story_id)
-        except Exception as e:
-            logger.error(f"Error getting story by ID: {e}")
+        except:
             return None
 
 # ================= DATABASE =================
@@ -717,8 +737,8 @@ async def stories_list(callback: types.CallbackQuery):
     await callback.answer("📚 Fetching stories from website...")
     
     loading_msg = await callback.message.edit_text(
-        "🔄 *Fetching stories from website...*\n"
-        "Scanning /story/ page for all stories...",
+        "🔄 *Fetching stories from /story/ page...*\n"
+        "Please wait...",
         parse_mode="Markdown"
     )
     
@@ -728,24 +748,21 @@ async def stories_list(callback: types.CallbackQuery):
         stories_today = Database(DATABASE_FILE).get_stories_read_today(callback.from_user.id)
         
         await loading_msg.edit_text(
-            f"📚 *Stories Found!*\n\n"
+            f"✅ *Stories Found!*\n\n"
             f"📖 Read today: {stories_today}/{DAILY_STORY_LIMIT}\n"
             f"🎁 Reward: ₹{STORY_READ_REWARD}/story\n"
             f"📊 Total stories: {story_data['total']}\n\n"
-            f"💡 Click on a story to read\n"
-            f"🌐 Use 'Read on Web' to open\n"
-            f"✅ Click 'Complete' after reading",
+            f"Click on a story to read:",
             reply_markup=get_stories_keyboard(story_data, 1),
             parse_mode="Markdown"
         )
     else:
+        # Show debug info and options
         await loading_msg.edit_text(
-            "⚠️ *No stories found!*\n\n"
-            "Possible reasons:\n"
-            "• Website might be down\n"
-            "• No stories on /story/ page\n"
-            "• Page structure changed\n\n"
-            "Try using the Web App directly:",
+            "⚠️ *No stories found on /story/ page*\n\n"
+            "Debug info saved to 'story_page_debug.html'\n"
+            "Check logs for more details.\n\n"
+            "Try these options:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📱 Open Web App", web_app=WebAppInfo(url=WEBSITE_URL))],
                 [InlineKeyboardButton(text="🔄 Try Again", callback_data="stories_list")],
@@ -780,7 +797,7 @@ async def stories_refresh(callback: types.CallbackQuery):
             parse_mode="Markdown"
         )
     else:
-        await callback.answer("❌ No stories found! Try using Web App.", show_alert=True)
+        await callback.answer("❌ No stories found! Check debug file.", show_alert=True)
 
 @dp.callback_query(lambda c: c.data.startswith("read_story_"))
 async def read_story(callback: types.CallbackQuery):
@@ -791,12 +808,12 @@ async def read_story(callback: types.CallbackQuery):
         text = f"""📖 *{story['title']}*
 
 📝 *How to read:*
-1. Click 'Read on Web' to open the full story
-2. Read the complete story on the website
-3. Come back and click '✅ Complete'
-4. Earn ₹{STORY_READ_REWARD} reward!
+1. Click 'Read on Web' to open
+2. Read the complete story
+3. Click '✅ Complete' to earn
+4. Get ₹{STORY_READ_REWARD} reward!
 
-💡 The story opens in your browser"""
+💡 Opens in your browser"""
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🌐 Read Full Story", url=story['url'])],
@@ -807,7 +824,7 @@ async def read_story(callback: types.CallbackQuery):
         
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
     else:
-        await callback.answer("Story not found! Try refreshing.", show_alert=True)
+        await callback.answer("Story not found!", show_alert=True)
     
     await callback.answer()
 
@@ -829,14 +846,14 @@ async def complete_story(callback: types.CallbackQuery):
     
     if db.complete_story(user_id, story_id, story['title']):
         balance = db.get_balance(user_id)
-        await callback.answer(f"✅ Story completed! +₹{STORY_READ_REWARD} earned!", show_alert=True)
+        await callback.answer(f"✅ +₹{STORY_READ_REWARD} earned!", show_alert=True)
         
         await callback.message.edit_text(
             f"✅ *Story Completed!*\n\n"
             f"📖 {story['title']}\n"
             f"💰 Reward: +₹{STORY_READ_REWARD}\n"
             f"💳 New Balance: ₹{balance}\n\n"
-            f"Keep reading to earn more!",
+            f"Keep reading!",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📚 Read More", callback_data="stories_list")],
                 [InlineKeyboardButton(text="◀️ Back to Menu", callback_data="back")]
@@ -844,7 +861,7 @@ async def complete_story(callback: types.CallbackQuery):
             parse_mode="Markdown"
         )
     else:
-        await callback.answer("Already completed this story!", show_alert=True)
+        await callback.answer("Already completed!", show_alert=True)
 
 @dp.callback_query(lambda c: c.data == "my_stories")
 async def my_stories(callback: types.CallbackQuery):
@@ -855,7 +872,6 @@ async def my_stories(callback: types.CallbackQuery):
         text = "📚 *Your Completed Stories*\n\n"
         for i, (story_id, title, date) in enumerate(completed[:10], 1):
             text += f"{i}. {title[:40]}\n   📅 {date[:10]}\n\n"
-        
         text += f"💰 Total Earned: ₹{len(completed) * STORY_READ_REWARD}"
     else:
         text = "📚 *No stories completed yet!*\n\nStart reading to earn rewards!"
@@ -902,10 +918,8 @@ async def stats_cmd(callback: types.CallbackQuery):
 💸 Withdrawn: ₹{stats['total_withdrawn']}
 👥 Referrals: {stats['referral_count']}
 📖 Stories Completed: {stats['completed_stories']}
-📚 Today's Reads: {stats['stories_today']}/{DAILY_STORY_LIMIT}
-📅 Joined: {str(stats['joined_date'])[:10]}
-
-💪 Keep going! Earn more by reading stories!"""
+📚 Today: {stats['stories_today']}/{DAILY_STORY_LIMIT}
+📅 Joined: {str(stats['joined_date'])[:10]}"""
     
     await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
     await callback.answer()
@@ -922,18 +936,16 @@ async def referral_cmd(callback: types.CallbackQuery):
 🔗 Your Link:
 `{link}`
 
-📊 Your Stats:
+📊 Stats:
 • Referrals: {stats['referral_count']}
-• Total Earned: ₹{stats['total_earned']}
+• Earned: ₹{stats['total_earned']}
 
 🎁 Rewards:
 • Per Referral: ₹{REFERRAL_BONUS}
-• Per Story: ₹{STORY_READ_REWARD}
-
-Share and earn!"""
+• Per Story: ₹{STORY_READ_REWARD}"""
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Share with Friends", switch_inline_query=f"Join and earn rewards! 📚💰")],
+        [InlineKeyboardButton(text="📤 Share", switch_inline_query=f"Join and earn! 📚💰")],
         [InlineKeyboardButton(text="◀️ Back", callback_data="back")]
     ])
     
@@ -946,14 +958,11 @@ async def withdraw_cmd(callback: types.CallbackQuery, state: FSMContext):
     balance = db.get_balance(callback.from_user.id)
     
     if balance < MINIMUM_WITHDRAWAL:
-        await callback.answer(f"❌ Minimum withdrawal is ₹{MINIMUM_WITHDRAWAL}! You have ₹{balance}", show_alert=True)
+        await callback.answer(f"❌ Minimum ₹{MINIMUM_WITHDRAWAL} needed! You have ₹{balance}", show_alert=True)
         return
     
     await callback.message.answer(
-        f"💰 Your balance: ₹{balance}\n"
-        f"Min withdrawal: ₹{MINIMUM_WITHDRAWAL}\n\n"
-        f"Enter amount to withdraw:\n"
-        f"Type /cancel"
+        f"💰 Balance: ₹{balance}\nMin: ₹{MINIMUM_WITHDRAWAL}\n\nEnter amount:\nType /cancel"
     )
     await state.set_state(WithdrawState.amount)
     await callback.answer()
@@ -971,19 +980,17 @@ async def withdraw_amount(message: types.Message, state: FSMContext):
         balance = db.get_balance(message.from_user.id)
         
         if amount < MINIMUM_WITHDRAWAL:
-            await message.answer(f"❌ Minimum withdrawal is ₹{MINIMUM_WITHDRAWAL}!")
+            await message.answer(f"❌ Minimum ₹{MINIMUM_WITHDRAWAL}!")
             return
-        
         if amount > balance:
-            await message.answer(f"❌ Insufficient balance! You have ₹{balance}")
+            await message.answer(f"❌ Insufficient! You have ₹{balance}")
             return
         
         await state.update_data(amount=amount)
-        await message.answer("📱 Enter your UPI ID:\nExample: example@upi\nType /cancel")
+        await message.answer("📱 Enter UPI ID:\nType /cancel")
         await state.set_state(WithdrawState.upi)
-        
     except ValueError:
-        await message.answer("❌ Please enter a valid number!")
+        await message.answer("❌ Enter a valid number!")
 
 @dp.message(WithdrawState.upi)
 async def withdraw_upi(message: types.Message, state: FSMContext):
@@ -993,43 +1000,29 @@ async def withdraw_upi(message: types.Message, state: FSMContext):
         return
     
     upi_id = message.text.strip()
-    
     if '@' not in upi_id or len(upi_id) < 5:
-        await message.answer("❌ Invalid UPI ID!")
+        await message.answer("❌ Invalid UPI!")
         return
     
     data = await state.get_data()
     amount = data['amount']
-    
     db = Database(DATABASE_FILE)
     
     if db.deduct_balance(message.from_user.id, amount):
         withdraw_id = db.create_withdrawal(message.from_user.id, amount, upi_id)
         
         await message.answer(
-            f"✅ *Withdrawal Submitted!*\n\n"
-            f"💰 Amount: ₹{amount}\n"
-            f"📱 UPI: `{upi_id}`\n"
-            f"🆔 ID: #{withdraw_id}\n\n"
-            f"Processing in 24-48 hours.",
+            f"✅ *Submitted!*\n\n💰 ₹{amount}\n📱 `{upi_id}`\n🆔 #{withdraw_id}\n\n24-48 hours processing.",
             parse_mode="Markdown"
         )
         
         for admin_id in ADMIN_IDS:
             try:
-                await bot.send_message(
-                    admin_id,
-                    f"💰 *New Withdrawal*\n"
-                    f"User: {message.from_user.first_name}\n"
-                    f"Amount: ₹{amount}\n"
-                    f"UPI: {upi_id}\n"
-                    f"ID: #{withdraw_id}",
-                    parse_mode="Markdown"
-                )
+                await bot.send_message(admin_id, f"💰 New Withdrawal\nUser: {message.from_user.first_name}\nAmount: ₹{amount}\nUPI: {upi_id}\nID: #{withdraw_id}")
             except:
                 pass
     else:
-        await message.answer("❌ Failed to process!")
+        await message.answer("❌ Failed!")
     
     await state.clear()
 
@@ -1037,26 +1030,17 @@ async def withdraw_upi(message: types.Message, state: FSMContext):
 async def help_cmd(callback: types.CallbackQuery):
     text = f"""📖 *Help Guide*
 
-*Earning:*
-📖 Read stories: ₹{STORY_READ_REWARD}/story
-👥 Referrals: ₹{REFERRAL_BONUS}/referral
-📊 Daily limit: {DAILY_STORY_LIMIT} stories
+*Earn:*
+📖 Read: ₹{STORY_READ_REWARD}/story
+👥 Refer: ₹{REFERRAL_BONUS}/referral
+📊 Daily limit: {DAILY_STORY_LIMIT}
 
-*How to read stories:*
-1. Click 'Browse Stories'
-2. Select a story
-3. Click 'Read on Web'
-4. Read the complete story
-5. Click 'Complete' to earn
-
-*Withdrawal:*
+*Withdraw:*
 💳 Min: ₹{MINIMUM_WITHDRAWAL}
 📱 UPI transfer
-⏱ 24-48 hours processing
 
-*Commands:*
-/start - Restart bot
-/help - Help guide"""
+/start - Restart
+/help - Help"""
     
     await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
     await callback.answer()
@@ -1067,10 +1051,7 @@ async def back_cmd(callback: types.CallbackQuery):
     balance = db.get_balance(callback.from_user.id)
     
     await callback.message.edit_text(
-        f"🌟 *Main Menu*\n\n"
-        f"💰 Balance: ₹{balance}\n\n"
-        f"📱 Use 'Open Stories App' to browse\n"
-        f"📚 Use 'Browse Stories' to see list",
+        f"🌟 *Main Menu*\n\n💰 Balance: ₹{balance}",
         reply_markup=get_main_keyboard(db.is_admin(callback.from_user.id)),
         parse_mode="Markdown"
     )
@@ -1078,19 +1059,17 @@ async def back_cmd(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "page_info")
 async def page_info(callback: types.CallbackQuery):
-    await callback.answer("Navigate using ◀️ ▶️ buttons", show_alert=True)
+    await callback.answer("Use ◀️ ▶️ to navigate", show_alert=True)
 
 # Admin handlers
 @dp.callback_query(lambda c: c.data == "admin_panel")
 async def admin_panel_cmd(callback: types.CallbackQuery):
     db = Database(DATABASE_FILE)
-    
     if not db.is_admin(callback.from_user.id):
         await callback.answer("❌ Admin only!", show_alert=True)
         return
     
     pending = db.get_pending_withdrawals()
-    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💰 Withdrawals ({len(pending)})", callback_data="admin_withdrawals")],
         [InlineKeyboardButton(text="🔄 Refresh Stories", callback_data="admin_refresh_stories")],
@@ -1103,44 +1082,37 @@ async def admin_panel_cmd(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "admin_refresh_stories")
 async def admin_refresh_stories(callback: types.CallbackQuery):
-    await callback.answer("🔄 Refreshing stories from /story/ page...")
-    
+    await callback.answer("🔄 Refreshing...")
     story_data = await story_fetcher.get_stories(force_refresh=True)
     
     if story_data['stories']:
-        await callback.message.answer(f"✅ Found {story_data['total']} stories on /story/ page!")
+        await callback.message.answer(f"✅ Found {story_data['total']} stories!")
     else:
-        await callback.message.answer("❌ No stories found on /story/ page!")
+        await callback.message.answer("❌ No stories! Check story_page_debug.html")
     
     await admin_panel_cmd(callback)
 
 @dp.callback_query(lambda c: c.data == "admin_withdrawals")
 async def admin_withdrawals_cmd(callback: types.CallbackQuery):
     db = Database(DATABASE_FILE)
-    
     if not db.is_admin(callback.from_user.id):
         await callback.answer("❌ Admin only!", show_alert=True)
         return
     
     withdrawals = db.get_pending_withdrawals()
-    
     if not withdrawals:
         await callback.message.answer("No pending withdrawals!")
         return
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     for w in withdrawals:
-        name = w[11] if w[11] else f"User_{w[1]}"
+        name = w[11] or f"User_{w[1]}"
         keyboard.inline_keyboard.append([
-            InlineKeyboardButton(
-                text=f"💰 {name[:15]} - ₹{w[2]}",
-                callback_data=f"process_{w[0]}"
-            )
+            InlineKeyboardButton(text=f"💰 {name[:15]} - ₹{w[2]}", callback_data=f"process_{w[0]}")
         ])
-    
     keyboard.inline_keyboard.append([InlineKeyboardButton(text="◀️ Back", callback_data="admin_panel")])
     
-    await callback.message.edit_text(f"💰 Pending Withdrawals ({len(withdrawals)})", reply_markup=keyboard)
+    await callback.message.edit_text(f"💰 Pending ({len(withdrawals)})", reply_markup=keyboard)
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("process_"))
@@ -1150,46 +1122,30 @@ async def process_withdrawal(callback: types.CallbackQuery):
     
     conn = db.get_conn()
     cursor = conn.cursor()
-    cursor.execute('''
-        SELECT w.*, u.first_name, u.username 
-        FROM withdrawals w
-        JOIN users u ON w.user_id = u.user_id
-        WHERE w.id = ?
-    ''', (withdraw_id,))
+    cursor.execute('''SELECT w.*, u.first_name, u.username FROM withdrawals w JOIN users u ON w.user_id = u.user_id WHERE w.id = ?''', (withdraw_id,))
     w = cursor.fetchone()
     conn.close()
     
     if not w:
-        await callback.message.answer("Withdrawal not found!")
+        await callback.message.answer("Not found!")
         return
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_{withdraw_id}"),
-            InlineKeyboardButton(text="❌ Reject", callback_data=f"reject_{withdraw_id}")
-        ],
+        [InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_{withdraw_id}"),
+         InlineKeyboardButton(text="❌ Reject", callback_data=f"reject_{withdraw_id}")],
         [InlineKeyboardButton(text="◀️ Back", callback_data="admin_withdrawals")]
     ])
     
-    text = f"""💰 *Withdrawal #{w[0]}*
-
-👤 User: {w[11]}
-📝 @{w[12] or 'N/A'}
-💰 Amount: ₹{w[2]}
-📱 UPI: {w[3]}
-📅 Date: {w[5]}"""
-    
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    text = f"💰 Withdrawal #{w[0]}\n👤 {w[11]}\n💰 ₹{w[2]}\n📱 {w[3]}"
+    await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("approve_"))
 async def approve_withdrawal(callback: types.CallbackQuery):
-    withdraw_id = int(callback.data.split("_")[1])
     db = Database(DATABASE_FILE)
-    db.approve_withdrawal(withdraw_id)
-    
+    db.approve_withdrawal(int(callback.data.split("_")[1]))
     await callback.answer("✅ Approved!", show_alert=True)
-    await callback.message.edit_text("✅ Withdrawal approved!")
+    await callback.message.edit_text("✅ Approved!")
     await asyncio.sleep(2)
     await admin_withdrawals_cmd(callback)
 
@@ -1207,26 +1163,24 @@ async def reject_withdrawal(callback: types.CallbackQuery):
     if result:
         user_id, amount = result
         db.reject_withdrawal(withdraw_id, user_id, amount)
-        
         try:
-            await bot.send_message(user_id, f"❌ Withdrawal of ₹{amount} rejected. Amount refunded.")
+            await bot.send_message(user_id, f"❌ Withdrawal of ₹{amount} rejected. Refunded.")
         except:
             pass
     
     await callback.answer("❌ Rejected!", show_alert=True)
-    await callback.message.edit_text("❌ Withdrawal rejected!")
+    await callback.message.edit_text("❌ Rejected!")
     await asyncio.sleep(2)
     await admin_withdrawals_cmd(callback)
 
 @dp.callback_query(lambda c: c.data == "admin_broadcast")
 async def admin_broadcast_cmd(callback: types.CallbackQuery, state: FSMContext):
     db = Database(DATABASE_FILE)
-    
     if not db.is_admin(callback.from_user.id):
         await callback.answer("❌ Admin only!", show_alert=True)
         return
     
-    await callback.message.answer("📢 Send message to broadcast:\nType /cancel")
+    await callback.message.answer("📢 Send message:\nType /cancel")
     await state.set_state(AdminState.broadcast)
     await callback.answer()
 
@@ -1239,7 +1193,6 @@ async def process_broadcast(message: types.Message, state: FSMContext):
     
     db = Database(DATABASE_FILE)
     users = db.get_all_users()
-    
     sent = 0
     status_msg = await message.answer("⏳ Broadcasting...")
     
@@ -1251,7 +1204,7 @@ async def process_broadcast(message: types.Message, state: FSMContext):
         except:
             pass
     
-    await status_msg.edit_text(f"✅ Broadcast sent to {sent} users!")
+    await status_msg.edit_text(f"✅ Sent to {sent} users!")
     await state.clear()
 
 @dp.errors()
@@ -1262,15 +1215,14 @@ async def error_handler(update: types.Update, exception: Exception):
 # ================= MAIN =================
 async def main():
     logger.info("🚀 Starting Story Bot...")
-    logger.info(f"📌 Story page URL: {STORY_PAGE_URL}")
+    logger.info(f"📌 Story page: {STORY_PAGE_URL}")
     
     db = Database(DATABASE_FILE)
     
-    # Pre-fetch stories on startup
     story_data = await story_fetcher.get_stories(force_refresh=True)
-    logger.info(f"📚 Pre-loaded {story_data['total']} stories from /story/ page")
+    logger.info(f"📚 Pre-loaded {story_data['total']} stories")
     
-    logger.info("✅ Bot is ready! Polling...")
+    logger.info("✅ Bot ready!")
     
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
