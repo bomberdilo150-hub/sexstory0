@@ -1405,17 +1405,19 @@ async def admin_test_referral(callback: types.CallbackQuery):
     
     recent = cursor.fetchall()
     
-    text = f"📊 **Referral Statistics**\n\n"
-    text += f"📝 Total referrals: `{total_referrals}`\n"
-    text += f"✅ Rewarded: `{rewarded}`\n"
-    text += f"⚠️ Unrewarded: `{unrewarded}`\n\n"
+    text = "📊 Referral Statistics\n\n"
+    text += f"📝 Total referrals: {total_referrals}\n"
+    text += f"✅ Rewarded: {rewarded}\n"
+    text += f"⚠️ Unrewarded: {unrewarded}\n\n"
     
     if recent:
-        text += "📋 **Recent 10 Referrals:**\n\n"
+        text += "📋 Recent 10 Referrals:\n\n"
         for r in recent:
             status = "✅" if r[4] else "❌"
-            text += f"{status} ID:{r[0]} | {r[5] or 'N/A'} -> {r[6] or 'N/A'}\n"
-            text += f"   Date: {r[3]} | Ref Balance: {r[7] or 0}\n\n"
+            ref_name = r[5] if r[5] else f"User{r[1]}"
+            refd_name = r[6] if r[6] else f"User{r[2]}"
+            text += f"{status} ID:{r[0]} | {ref_name} -> {refd_name}\n"
+            text += f"   Date: {r[3]} | Ref Balance: {r[7] if r[7] else 0}\n\n"
     else:
         text += "❌ No referrals found in database!\n\n"
         text += "⚠️ Referral system not working!\n"
@@ -1425,11 +1427,9 @@ async def admin_test_referral(callback: types.CallbackQuery):
     
     await callback.message.edit_text(
         text[:4000],
-        reply_markup=admin_keyboard(),
-        parse_mode="Markdown"
+        reply_markup=admin_keyboard()
     )
     await callback.answer()
-
 @dp.callback_query(lambda c: c.data == "admin_all_referrals")
 async def admin_all_referrals(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
