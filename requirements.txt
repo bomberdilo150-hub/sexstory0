@@ -1,4 +1,7 @@
-aiogram
+aiogram>=3.4.0
 aiohttp
 beautifulsoup4
+selenium
+webdriver-manager
 python-dotenv
+lxml
