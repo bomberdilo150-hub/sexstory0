@@ -24,7 +24,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 
 # ================= CONFIG =================
-API_TOKEN = ""
+API_TOKEN = "8777177819:AAH5v7Dbckc-iNByI6U9AT479l1E9zmgSzY"
 WEBSITE_URL = "https://sexstory.lovable.app"
 DATABASE_FILE = "bot_database.db"
 ADMIN_IDS = [8459969831]  # Your admin ID
