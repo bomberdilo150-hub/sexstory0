@@ -24,7 +24,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 
 # ================= CONFIG =================
-API_TOKEN = "8777177819:AAH5v7Dbckc-iNByI6U9AT479l1E9zmgSzY"
+API_TOKEN = ""
 WEBSITE_URL = "https://sexstory.lovable.app"
 DATABASE_FILE = "bot_database.db"
 ADMIN_IDS = [8459969831]  # Your admin ID
@@ -112,7 +112,7 @@ class Database:
 
         conn.commit()
         conn.close()
-        logger.info("Database initialized successfully")
+        logger.info("✅ Database initialized successfully")
 
     def add_user(self, user_id: int, username: str = None, first_name: str = None, referred_by: int = None):
         conn = self.get_conn()
@@ -122,13 +122,29 @@ class Database:
         exists = cursor.fetchone()
 
         if not exists:
+            logger.info(f"📝 New user registering: {user_id} | Referred by: {referred_by}")
+            
             cursor.execute("""
                 INSERT INTO users (user_id, username, first_name, registration_date, referred_by)
                 VALUES (?, ?, ?, ?, ?)
             """, (user_id, username, first_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), referred_by))
+            
+            conn.commit()
+            logger.info(f"✅ User {user_id} inserted successfully")
 
+            # Process referral AFTER user is inserted
             if referred_by and referred_by != user_id:
-                self.process_referral(referred_by, user_id)
+                # Check if referrer exists
+                cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (referred_by,))
+                referrer = cursor.fetchone()
+                
+                if referrer:
+                    logger.info(f"🎯 Processing referral: {referred_by} referred {user_id}")
+                    self.process_referral(referred_by, user_id)
+                else:
+                    logger.warning(f"⚠️ Referrer {referred_by} not found in database")
+        else:
+            logger.info(f"ℹ️ User {user_id} already exists")
 
         conn.commit()
         conn.close()
@@ -137,18 +153,35 @@ class Database:
         conn = self.get_conn()
         cursor = conn.cursor()
 
+        # Check if this referral already exists
         cursor.execute("SELECT id FROM referrals WHERE referrer_id = ? AND referred_id = ?", 
                       (referrer_id, referred_id))
-        if not cursor.fetchone():
+        existing = cursor.fetchone()
+        
+        if not existing:
+            logger.info(f"💰 Adding referral bonus: {REFERRAL_BONUS} coins to referrer {referrer_id}")
+            
+            # Insert referral record with reward_given = 1 (true)
             cursor.execute("""
                 INSERT INTO referrals (referrer_id, referred_id, date, reward_given)
                 VALUES (?, ?, ?, ?)
-            """, (referrer_id, referred_id, datetime.now().strftime("%Y-%m-%d"), 0))
+            """, (referrer_id, referred_id, datetime.now().strftime("%Y-%m-%d"), 1))
 
+            # Add bonus to referrer's balance
             cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", 
                           (REFERRAL_BONUS, referrer_id))
+            
+            conn.commit()
+            logger.info(f"✅ Referral completed: User {referrer_id} got {REFERRAL_BONUS} coins for referring {referred_id}")
+            
+            # Verify the update
+            cursor.execute("SELECT balance FROM users WHERE user_id = ?", (referrer_id,))
+            new_balance = cursor.fetchone()
+            if new_balance:
+                logger.info(f"💰 Referrer {referrer_id} new balance: {new_balance[0]}")
+        else:
+            logger.info(f"⚠️ Duplicate referral prevented: {referrer_id} already referred {referred_id}")
 
-        conn.commit()
         conn.close()
 
     def update_upi_id(self, user_id: int, upi_id: str):
@@ -184,8 +217,11 @@ class Database:
         """, (user_id,))
         user_data = cursor.fetchone()
 
-        cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (user_id,))
+        # Count referrals where this user is the referrer
+        cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND reward_given = 1", (user_id,))
         referral_count = cursor.fetchone()[0]
+        
+        logger.info(f"📊 Stats for user {user_id}: referrals count = {referral_count}")
 
         cursor.execute("SELECT COUNT(*) FROM withdrawals WHERE user_id = ? AND status = 'pending'", (user_id,))
         pending_withdrawals = cursor.fetchone()[0]
@@ -410,6 +446,51 @@ class Database:
         conn.close()
         return users
 
+    def get_referral_details(self, user_id: int) -> List[Dict]:
+        """Get detailed referral information for a user"""
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT r.referred_id, u.first_name, u.username, r.date, r.reward_given
+            FROM referrals r
+            LEFT JOIN users u ON r.referred_id = u.user_id
+            WHERE r.referrer_id = ?
+            ORDER BY r.date DESC
+        """, (user_id,))
+        
+        referrals = []
+        for row in cursor.fetchall():
+            referrals.append({
+                'referred_id': row[0],
+                'name': row[1] or f"User{row[0]}",
+                'username': row[2],
+                'date': row[3],
+                'rewarded': row[4]
+            })
+        
+        conn.close()
+        return referrals
+
+    def get_all_referrals_for_admin(self) -> List:
+        """Get all referrals for admin panel"""
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT r.referrer_id, r.referred_id, r.date, r.reward_given,
+                   u1.first_name as referrer_name, u2.first_name as referred_name
+            FROM referrals r
+            LEFT JOIN users u1 ON r.referrer_id = u1.user_id
+            LEFT JOIN users u2 ON r.referred_id = u2.user_id
+            ORDER BY r.date DESC
+            LIMIT 30
+        """)
+        
+        referrals = cursor.fetchall()
+        conn.close()
+        return referrals
+
 # Global DB instance
 DB = Database(DATABASE_FILE)
 
@@ -617,6 +698,8 @@ def admin_keyboard():
             [InlineKeyboardButton(text="🔄 Refresh Stories", callback_data="admin_refresh")],
             [InlineKeyboardButton(text="🔍 Debug Stories", callback_data="admin_debug")],
             [InlineKeyboardButton(text="📋 User List", callback_data="admin_users")],
+            [InlineKeyboardButton(text="🧪 Test Referrals", callback_data="admin_test_referral")],
+            [InlineKeyboardButton(text="👥 All Referrals", callback_data="admin_all_referrals")],
             [InlineKeyboardButton(text="◀️ Back to Menu", callback_data="back_to_menu")]
         ]
     )
@@ -632,7 +715,9 @@ async def start(message: types.Message):
             referred_by = int(args[1].split("_")[1])
             if referred_by == message.from_user.id:
                 referred_by = None
-        except:
+            logger.info(f"🔗 Referral link detected: referrer={referred_by}, new_user={message.from_user.id}")
+        except Exception as e:
+            logger.error(f"Error parsing referral: {e}")
             pass
     
     DB.add_user(
@@ -651,6 +736,23 @@ async def start(message: types.Message):
         f"✨ Stories open in Mini App!\n"
         f"👇 Tap below to start!"
     )
+    
+    # Send notification to referrer if applicable
+    if referred_by and referred_by != message.from_user.id:
+        try:
+            referrer_stats = DB.get_user_stats(referred_by)
+            if referrer_stats:
+                await bot.send_message(
+                    referred_by,
+                    f"🎉 **New Referral!**\n\n"
+                    f"👤 {message.from_user.first_name} joined using your link!\n"
+                    f"💰 You earned `{REFERRAL_BONUS}` coins!\n"
+                    f"👥 Total referrals: `{referrer_stats['referrals']}`\n"
+                    f"💰 New balance: `{referrer_stats['balance']}` coins",
+                    parse_mode="Markdown"
+                )
+        except Exception as e:
+            logger.error(f"Failed to notify referrer {referred_by}: {e}")
     
     await message.answer(welcome_text, reply_markup=main_keyboard(), parse_mode="Markdown")
 
@@ -756,14 +858,24 @@ async def referral(callback: types.CallbackQuery):
     bot_username = (await bot.get_me()).username
     referral_link = f"https://t.me/{bot_username}?start=ref_{callback.from_user.id}"
     
+    # Get detailed referral list
+    referral_details = DB.get_referral_details(callback.from_user.id)
+    
     text = (
         f"👥 **Referral Program**\n\n"
         f"🎁 `{REFERRAL_BONUS}` coins per referral!\n\n"
         f"🔗 **Your link:**\n"
         f"`{referral_link}`\n\n"
-        f"👥 Referrals: `{stats['referrals'] if stats else 0}`\n\n"
-        f"Share and earn!"
+        f"👥 Total Referrals: `{stats['referrals'] if stats else 0}`\n\n"
     )
+    
+    if referral_details:
+        text += "📋 **Your Referrals:**\n"
+        for ref in referral_details[:10]:  # Show last 10
+            status = "✅" if ref['rewarded'] else "⏳"
+            text += f"{status} {ref['name']} - {ref['date']}\n"
+    
+    text += "\nShare and earn!"
     
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1112,12 +1224,23 @@ async def admin_stats(callback: types.CallbackQuery):
     total_balance = DB.get_total_balance()
     pending_withdrawals = len(DB.get_pending_withdrawals())
     
+    # Get total referrals
+    conn = DB.get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM referrals")
+    total_referrals = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM referrals WHERE reward_given = 1")
+    rewarded_referrals = cursor.fetchone()[0]
+    conn.close()
+    
     text = (
         f"📊 **Bot Statistics**\n\n"
         f"👥 Total users: `{total_users}`\n"
         f"📚 Total stories read: `{total_stories}`\n"
         f"💰 Total balance: `{total_balance}` coins\n"
-        f"💸 Pending withdrawals: `{pending_withdrawals}`\n\n"
+        f"💸 Pending withdrawals: `{pending_withdrawals}`\n"
+        f"👥 Total referrals: `{total_referrals}`\n"
+        f"✅ Rewarded referrals: `{rewarded_referrals}`\n\n"
         f"⚙️ **Settings:**\n"
         f"• Daily limit: `{DAILY_STORY_LIMIT}` stories\n"
         f"• Reward per story: `{STORY_READ_REWARD}` coin\n"
@@ -1162,7 +1285,7 @@ async def admin_refresh(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "admin_debug")
 async def admin_debug(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from.user.id):
         await callback.answer("Unauthorized!", show_alert=True)
         return
     
@@ -1249,6 +1372,94 @@ async def admin_users(callback: types.CallbackQuery):
     )
     await callback.answer()
 
+@dp.callback_query(lambda c: c.data == "admin_test_referral")
+async def admin_test_referral(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized!", show_alert=True)
+        return
+    
+    conn = DB.get_conn()
+    cursor = conn.cursor()
+    
+    # Total referrals
+    cursor.execute("SELECT COUNT(*) FROM referrals")
+    total_referrals = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM referrals WHERE reward_given = 1")
+    rewarded = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM referrals WHERE reward_given = 0")
+    unrewarded = cursor.fetchone()[0]
+    
+    # Recent 10 referrals
+    cursor.execute("""
+        SELECT r.id, r.referrer_id, r.referred_id, r.date, r.reward_given,
+               u1.first_name as ref_name, u2.first_name as refd_name,
+               u1.balance as ref_balance
+        FROM referrals r
+        LEFT JOIN users u1 ON r.referrer_id = u1.user_id
+        LEFT JOIN users u2 ON r.referred_id = u2.user_id
+        ORDER BY r.id DESC
+        LIMIT 10
+    """)
+    
+    recent = cursor.fetchall()
+    
+    text = f"📊 **Referral Statistics**\n\n"
+    text += f"📝 Total referrals: `{total_referrals}`\n"
+    text += f"✅ Rewarded: `{rewarded}`\n"
+    text += f"⚠️ Unrewarded: `{unrewarded}`\n\n"
+    
+    if recent:
+        text += "📋 **Recent 10 Referrals:**\n\n"
+        for r in recent:
+            status = "✅" if r[4] else "❌"
+            text += f"{status} ID:{r[0]} | {r[5] or 'N/A'} -> {r[6] or 'N/A'}\n"
+            text += f"   Date: {r[3]} | Ref Balance: {r[7] or 0}\n\n"
+    else:
+        text += "❌ No referrals found in database!\n\n"
+        text += "⚠️ Referral system not working!\n"
+        text += "Check /start command with ref_ parameter"
+    
+    conn.close()
+    
+    await callback.message.edit_text(
+        text[:4000],
+        reply_markup=admin_keyboard(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "admin_all_referrals")
+async def admin_all_referrals(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized!", show_alert=True)
+        return
+    
+    referrals = DB.get_all_referrals_for_admin()
+    
+    if not referrals:
+        await callback.message.edit_text(
+            "📋 **No referrals found!**",
+            reply_markup=admin_keyboard(),
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+    
+    text = "👥 **All Referrals (Last 30):**\n\n"
+    for ref in referrals:
+        status = "✅" if ref[3] else "❌"
+        text += f"{status} {ref[4] or 'User'+str(ref[0])} referred {ref[5] or 'User'+str(ref[1])}\n"
+        text += f"   Date: {ref[2]}\n\n"
+    
+    await callback.message.edit_text(
+        text[:4000],
+        reply_markup=admin_keyboard(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
 @dp.callback_query(lambda c: c.data == "admin_back")
 async def admin_back(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1329,6 +1540,17 @@ async def main():
     stories = await FETCHER.get_stories()
     logger.info(f"✅ Found {len(stories)} stories")
     
+    # Test database connection and referrals
+    conn = DB.get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM referrals")
+    ref_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM users")
+    user_count = cursor.fetchone()[0]
+    conn.close()
+    
+    logger.info(f"📊 Database Status: {user_count} users, {ref_count} referrals")
+    
     # Set bot commands
     await bot.set_my_commands([
         types.BotCommand(command="start", description="🚀 Start the bot"),
@@ -1339,7 +1561,7 @@ async def main():
     # Remove webhook and start polling
     await bot.delete_webhook(drop_pending_updates=True)
     
-    logger.info("✅ Bot is running with all features!")
+    logger.info("✅ Bot is running with all features! Referral system is active.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
