@@ -1,5 +1,5 @@
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 import re
 from typing import List, Dict, Optional
 import time
-import os
+import json
 
 # Selenium imports
 from selenium import webdriver
@@ -27,7 +27,7 @@ from selenium.webdriver.chrome.options import Options
 API_TOKEN = "8777177819:AAHuJtPJR8VmoWSfqHtrHW7WeVNWJ6sbV7o"
 WEBSITE_URL = "https://sexstory.lovable.app"
 DATABASE_FILE = "bot_database.db"
-ADMIN_IDS = [8459969831]
+ADMIN_IDS = [8459969831]  # Your admin ID
 
 REFERRAL_BONUS = 10
 MINIMUM_WITHDRAWAL = 100
@@ -44,7 +44,7 @@ bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# ================= DATABASE WITH MIGRATION =================
+# ================= DATABASE =================
 class Database:
     def __init__(self, db_file: str):
         self.db_file = db_file
@@ -57,39 +57,7 @@ class Database:
         conn = self.get_conn()
         cursor = conn.cursor()
 
-        # Check if old database exists and needs migration
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
-        table_exists = cursor.fetchone()
-        
-        if table_exists:
-            # Check columns in existing table
-            cursor.execute("PRAGMA table_info(users)")
-            columns = [col[1] for col in cursor.fetchall()]
-            
-            # Add missing columns if needed
-            if 'balance' not in columns:
-                cursor.execute("ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0")
-                logger.info("Added balance column")
-            if 'stories_read_today' not in columns:
-                cursor.execute("ALTER TABLE users ADD COLUMN stories_read_today INTEGER DEFAULT 0")
-                logger.info("Added stories_read_today column")
-            if 'last_story_date' not in columns:
-                cursor.execute("ALTER TABLE users ADD COLUMN last_story_date TEXT")
-                logger.info("Added last_story_date column")
-            if 'total_stories_read' not in columns:
-                cursor.execute("ALTER TABLE users ADD COLUMN total_stories_read INTEGER DEFAULT 0")
-                logger.info("Added total_stories_read column")
-            if 'referred_by' not in columns:
-                cursor.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
-                logger.info("Added referred_by column")
-            if 'registration_date' not in columns:
-                cursor.execute("ALTER TABLE users ADD COLUMN registration_date TEXT")
-                logger.info("Added registration_date column")
-            if 'is_banned' not in columns:
-                cursor.execute("ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT 0")
-                logger.info("Added is_banned column")
-
-        # Create tables if not exist
+        # Create users table
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -101,34 +69,36 @@ class Database:
             total_stories_read INTEGER DEFAULT 0,
             referred_by INTEGER,
             registration_date TEXT,
-            is_banned BOOLEAN DEFAULT 0
+            is_banned BOOLEAN DEFAULT 0,
+            upi_id TEXT
         )
         """)
 
+        # Create referrals table
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS referrals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             referrer_id INTEGER,
             referred_id INTEGER,
             date TEXT,
-            reward_given BOOLEAN DEFAULT 0,
-            FOREIGN KEY (referrer_id) REFERENCES users (user_id),
-            FOREIGN KEY (referred_id) REFERENCES users (user_id)
+            reward_given BOOLEAN DEFAULT 0
         )
         """)
 
+        # Create withdrawals table
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS withdrawals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             amount INTEGER,
+            upi_id TEXT,
             status TEXT DEFAULT 'pending',
             request_date TEXT,
-            processed_date TEXT,
-            FOREIGN KEY (user_id) REFERENCES users (user_id)
+            processed_date TEXT
         )
         """)
 
+        # Create stories_read table
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS stories_read (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,8 +123,8 @@ class Database:
 
         if not exists:
             cursor.execute("""
-                INSERT INTO users (user_id, username, first_name, registration_date, referred_by, balance, stories_read_today, total_stories_read)
-                VALUES (?, ?, ?, ?, ?, 0, 0, 0)
+                INSERT INTO users (user_id, username, first_name, registration_date, referred_by)
+                VALUES (?, ?, ?, ?, ?)
             """, (user_id, username, first_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), referred_by))
 
             if referred_by and referred_by != user_id:
@@ -180,6 +150,21 @@ class Database:
 
         conn.commit()
         conn.close()
+
+    def update_upi_id(self, user_id: int, upi_id: str):
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET upi_id = ? WHERE user_id = ?", (upi_id, user_id))
+        conn.commit()
+        conn.close()
+
+    def get_upi_id(self, user_id: int) -> str:
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT upi_id FROM users WHERE user_id = ?", (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
 
     def get_balance(self, user_id: int) -> int:
         conn = self.get_conn()
@@ -269,7 +254,7 @@ class Database:
         conn.close()
         return True, "success"
 
-    def request_withdrawal(self, user_id: int, amount: int) -> bool:
+    def request_withdrawal(self, user_id: int, amount: int, upi_id: str) -> bool:
         conn = self.get_conn()
         cursor = conn.cursor()
 
@@ -289,11 +274,10 @@ class Database:
             return False
 
         cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
-
         cursor.execute("""
-            INSERT INTO withdrawals (user_id, amount, request_date, status)
-            VALUES (?, ?, ?, 'pending')
-        """, (user_id, amount, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            INSERT INTO withdrawals (user_id, amount, upi_id, request_date, status)
+            VALUES (?, ?, ?, ?, 'pending')
+        """, (user_id, amount, upi_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 
         conn.commit()
         conn.close()
@@ -304,7 +288,7 @@ class Database:
         cursor = conn.cursor()
 
         cursor.execute("""
-            SELECT id, user_id, amount, request_date 
+            SELECT id, user_id, amount, upi_id, request_date 
             FROM withdrawals 
             WHERE status = 'pending'
             ORDER BY request_date ASC
@@ -316,7 +300,8 @@ class Database:
                 'id': row[0],
                 'user_id': row[1],
                 'amount': row[2],
-                'date': row[3]
+                'upi_id': row[3],
+                'date': row[4]
             })
 
         conn.close()
@@ -377,7 +362,6 @@ class Database:
         for row in cursor.fetchall():
             leaders.append({
                 'user_id': row[0],
-                'username': row[1],
                 'name': row[2] or f"User {row[0]}",
                 'stories': row[3] or 0,
                 'balance': row[4] or 0
@@ -418,16 +402,24 @@ class Database:
         conn.close()
         return total
 
+    def get_all_users_list(self, limit=20):
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, username, first_name, balance, total_stories_read FROM users ORDER BY user_id DESC LIMIT ?", (limit,))
+        users = cursor.fetchall()
+        conn.close()
+        return users
+
+# Global DB instance
 DB = Database(DATABASE_FILE)
 
-# ================= STORY FETCHER WITH SELENIUM =================
+# ================= STORY FETCHER =================
 class StoryFetcher:
     def __init__(self):
         self.stories = []
         self.last_update = None
 
     def get_driver(self):
-        """Selenium WebDriver instance create karega"""
         try:
             options = Options()
             options.add_argument("--headless")
@@ -435,6 +427,8 @@ class StoryFetcher:
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--disable-gpu")
             options.add_argument("--window-size=1920,1080")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             
             driver = webdriver.Chrome(
                 service=Service(ChromeDriverManager().install()),
@@ -446,24 +440,22 @@ class StoryFetcher:
             return None
 
     def get_stories_selenium(self) -> List[Dict]:
-        """Selenium se stories fetch karega"""
         driver = None
         try:
             driver = self.get_driver()
             if not driver:
                 return []
 
-            logger.info("Loading website with Selenium...")
             driver.get(WEBSITE_URL)
-            
             time.sleep(5)
             
-            # Scroll to load all content
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
+            # Scroll multiple times
+            for _ in range(3):
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(2)
             
+            # Find all story links
             links = driver.find_elements(By.TAG_NAME, "a")
-            
             stories = []
             seen_urls = set()
             
@@ -472,18 +464,21 @@ class StoryFetcher:
                     href = link.get_attribute("href")
                     title = link.text.strip()
                     
-                    if href and "/story/" in href and title:
+                    if href and "/story/" in href:
                         if href not in seen_urls:
                             seen_urls.add(href)
+                            if not title or len(title) < 3:
+                                # Try to get title from parent
+                                parent = link.find_element(By.XPATH, "..")
+                                title = parent.text.strip()[:100] if parent else "Story"
                             stories.append({
-                                "title": title[:100],
+                                "title": title[:100] if title else "Story",
                                 "url": href
                             })
                 except:
                     continue
             
             driver.quit()
-            
             logger.info(f"Selenium se {len(stories)} stories mili")
             return stories[:20]
             
@@ -494,9 +489,7 @@ class StoryFetcher:
             return []
 
     async def get_stories_fallback(self) -> List[Dict]:
-        """Agar Selenium fail ho to aiohttp se fetch karega"""
         stories = []
-        
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(WEBSITE_URL, timeout=15, headers={
@@ -508,18 +501,16 @@ class StoryFetcher:
                     html = await response.text()
                     soup = BeautifulSoup(html, 'html.parser')
                     
+                    # Find all links
                     all_links = soup.find_all('a', href=True)
                     seen_urls = set()
                     
                     for link in all_links:
                         href = link.get('href', '')
                         if '/story/' in href:
-                            if href.startswith('/'):
-                                full_url = WEBSITE_URL + href
-                            else:
-                                full_url = href
-                            
+                            full_url = WEBSITE_URL + href if href.startswith('/') else href
                             title = link.get_text(strip=True)
+                            
                             if not title or len(title) < 3:
                                 parent = link.find_parent(['div', 'article', 'section'])
                                 if parent:
@@ -528,7 +519,7 @@ class StoryFetcher:
                                         title = title_elem.get_text(strip=True)
                             
                             if not title:
-                                title = "Sex Story"
+                                title = "Story"
                             
                             if full_url and full_url not in seen_urls:
                                 seen_urls.add(full_url)
@@ -545,19 +536,20 @@ class StoryFetcher:
             return []
 
     async def get_stories(self) -> List[Dict]:
-        """Main method - pehle Selenium try karega, phir fallback"""
+        # Return cached stories if fresh
         if self.stories and self.last_update:
             age = (datetime.now() - self.last_update).seconds
             if age < 300:
                 return self.stories
         
-        logger.info("Trying Selenium...")
+        # Try Selenium first
         stories = self.get_stories_selenium()
         
+        # If Selenium fails, try fallback
         if not stories:
-            logger.info("Selenium failed, trying fallback...")
             stories = await self.get_stories_fallback()
         
+        # Add IDs
         for i, story in enumerate(stories, 1):
             story['id'] = i
         
@@ -565,7 +557,7 @@ class StoryFetcher:
         self.last_update = datetime.now()
         
         if not stories:
-            logger.warning("❌ Koi story nahi mili!")
+            logger.warning("❌ No stories found!")
         else:
             logger.info(f"✅ Total {len(stories)} stories ready")
         
@@ -575,6 +567,7 @@ FETCHER = StoryFetcher()
 
 # ================= STATES =================
 class WithdrawState(StatesGroup):
+    upi_id = State()
     amount = State()
 
 class AdminState(StatesGroup):
@@ -595,6 +588,9 @@ def main_keyboard():
             [
                 InlineKeyboardButton(text="💸 Withdraw", callback_data="withdraw"),
                 InlineKeyboardButton(text="🏆 Leaderboard", callback_data="leaderboard")
+            ],
+            [
+                InlineKeyboardButton(text="🌐 Open Website", web_app=WebAppInfo(url=WEBSITE_URL))
             ]
         ]
     )
@@ -604,11 +600,11 @@ def story_keyboard(stories: List[Dict]):
     for story in stories[:10]:
         buttons.append([InlineKeyboardButton(
             text=f"📖 {story['title'][:50]}",
-            url=story['url']
+            web_app=WebAppInfo(url=story['url'])
         )])
     
     buttons.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="refresh_stories")])
-    buttons.append([InlineKeyboardButton(text="◀️ Back", callback_data="back_to_menu")])
+    buttons.append([InlineKeyboardButton(text="◀️ Back to Menu", callback_data="back_to_menu")])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -616,15 +612,16 @@ def admin_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast")],
-            [InlineKeyboardButton(text="💵 Withdrawals", callback_data="admin_withdrawals")],
-            [InlineKeyboardButton(text="📊 Stats", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="💵 Pending Withdrawals", callback_data="admin_withdrawals")],
+            [InlineKeyboardButton(text="📊 Bot Statistics", callback_data="admin_stats")],
             [InlineKeyboardButton(text="🔄 Refresh Stories", callback_data="admin_refresh")],
             [InlineKeyboardButton(text="🔍 Debug Stories", callback_data="admin_debug")],
-            [InlineKeyboardButton(text="◀️ Back", callback_data="back_to_menu")]
+            [InlineKeyboardButton(text="📋 User List", callback_data="admin_users")],
+            [InlineKeyboardButton(text="◀️ Back to Menu", callback_data="back_to_menu")]
         ]
     )
 
-# ================= HANDLERS =================
+# ================= USER HANDLERS =================
 @dp.message(Command("start"))
 async def start(message: types.Message):
     args = message.text.split()
@@ -651,6 +648,7 @@ async def start(message: types.Message):
         f"💰 `{STORY_READ_REWARD}` coin per story\n"
         f"📖 `{DAILY_STORY_LIMIT}` stories per day\n"
         f"👥 `{REFERRAL_BONUS}` coins per referral\n\n"
+        f"✨ Stories open in Mini App!\n"
         f"👇 Tap below to start!"
     )
     
@@ -667,22 +665,20 @@ async def back_to_menu(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "refresh_stories")
 async def refresh_stories(callback: types.CallbackQuery):
-    await callback.message.edit_text("🔄 Refreshing stories from website...\n\n⏳ Using Selenium, please wait...")
+    await callback.message.edit_text("🔄 Refreshing stories from website...\n\n⏳ Please wait...")
     
     FETCHER.last_update = None
     stories = await FETCHER.get_stories()
     
     if stories:
         await callback.message.edit_text(
-            f"✅ **{len(stories)} stories found!**\n\nTap any story to read:",
+            f"✅ **{len(stories)} stories found!**\n\n✨ Tap any story to read:",
             reply_markup=story_keyboard(stories),
             parse_mode="Markdown"
         )
     else:
         await callback.message.edit_text(
-            "❌ **No stories found on website!**\n\n"
-            "Website pe koi story nahi hai currently.\n"
-            "Check website first: sexstory.lovable.app",
+            "❌ **No stories found on website!**\n\nCheck website: sexstory.lovable.app",
             reply_markup=main_keyboard(),
             parse_mode="Markdown"
         )
@@ -690,16 +686,13 @@ async def refresh_stories(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "stories")
 async def stories(callback: types.CallbackQuery):
-    await callback.message.edit_text("📖 Loading stories from website...\n\n⏳ Using Selenium, please wait...")
+    await callback.message.edit_text("📖 Loading stories from website...\n\n⏳ Please wait...")
     
     stories_list = await FETCHER.get_stories()
 
     if not stories_list:
         await callback.message.edit_text(
-            "❌ **No stories available on website!**\n\n"
-            "⚠️ Bot sirf real website stories dikhata hai.\n\n"
-            "🔗 Check website: sexstory.lovable.app\n\n"
-            "Jab website pe stories hongi, yahan dikhengi.",
+            "❌ **No stories available on website!**\n\n🔗 Check website: sexstory.lovable.app",
             reply_markup=main_keyboard(),
             parse_mode="Markdown"
         )
@@ -719,15 +712,17 @@ async def stories(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "balance")
 async def balance(callback: types.CallbackQuery):
     stats = DB.get_user_stats(callback.from_user.id)
+    upi = DB.get_upi_id(callback.from_user.id)
     
     if stats:
+        upi_text = f"\n💳 UPI: `{upi if upi else 'Not set'}`" if upi else "\n💳 UPI: `Not set`"
         text = (
             f"💰 **Your Balance:** `{stats['balance']}` coins\n\n"
             f"📊 **Statistics:**\n"
             f"• Total read: `{stats['total_read']}`\n"
             f"• Today: `{stats['today_read']}/{DAILY_STORY_LIMIT}`\n"
             f"• Referrals: `{stats['referrals']}`\n"
-            f"• Pending withdrawals: `{stats['pending_withdrawals']}`\n\n"
+            f"• Pending withdrawals: `{stats['pending_withdrawals']}`{upi_text}\n\n"
             f"💸 Min withdrawal: `{MINIMUM_WITHDRAWAL}` coins"
         )
     else:
@@ -811,18 +806,70 @@ async def withdraw_request(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     
-    await callback.message.edit_text(
-        f"💸 **Withdrawal Request**\n\n"
+    upi_id = DB.get_upi_id(callback.from_user.id)
+    
+    if upi_id:
+        await callback.message.edit_text(
+            f"💸 **Withdrawal Request**\n\n"
+            f"💰 Balance: `{balance}` coins\n"
+            f"💳 UPI: `{upi_id}`\n"
+            f"💸 Minimum: `{MINIMUM_WITHDRAWAL}` coins\n\n"
+            f"✏️ Enter amount to withdraw:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="back_to_menu")]]
+            ),
+            parse_mode="Markdown"
+        )
+        await state.update_data(upi_id=upi_id)
+        await state.set_state(WithdrawState.amount)
+    else:
+        await callback.message.edit_text(
+            f"💸 **Withdrawal Request**\n\n"
+            f"💰 Balance: `{balance}` coins\n"
+            f"💸 Minimum: `{MINIMUM_WITHDRAWAL}` coins\n\n"
+            f"📱 **Please enter your UPI ID:**\n"
+            f"(e.g., name@okhdfcbank or 9876543210@paytm)\n\n"
+            f"Type /cancel to cancel",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="back_to_menu")]]
+            ),
+            parse_mode="Markdown"
+        )
+        await state.set_state(WithdrawState.upi_id)
+    
+    await callback.answer()
+
+@dp.message(WithdrawState.upi_id)
+async def process_upi_id(message: types.Message, state: FSMContext):
+    upi_id = message.text.strip()
+    
+    # Basic UPI ID validation
+    if '@' not in upi_id or len(upi_id) < 5:
+        await message.answer(
+            "❌ **Invalid UPI ID!**\n\n"
+            "Valid examples:\n"
+            "• `username@okhdfcbank`\n"
+            "• `9876543210@paytm`\n"
+            "• `name@ybl`\n\n"
+            "Try again or /cancel",
+            parse_mode="Markdown"
+        )
+        return
+    
+    DB.update_upi_id(message.from_user.id, upi_id)
+    balance = DB.get_balance(message.from_user.id)
+    
+    await message.answer(
+        f"✅ UPI ID saved: `{upi_id}`\n\n"
         f"💰 Balance: `{balance}` coins\n"
         f"💸 Minimum: `{MINIMUM_WITHDRAWAL}` coins\n\n"
-        f"✏️ Enter amount to withdraw:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="back_to_menu")]]
-        ),
+        f"✏️ **Enter amount to withdraw:**",
+        reply_markup=main_keyboard(),
         parse_mode="Markdown"
     )
+    
+    await state.update_data(upi_id=upi_id)
     await state.set_state(WithdrawState.amount)
-    await callback.answer()
 
 @dp.message(WithdrawState.amount)
 async def process_withdrawal(message: types.Message, state: FSMContext):
@@ -831,31 +878,51 @@ async def process_withdrawal(message: types.Message, state: FSMContext):
         
         if amount < MINIMUM_WITHDRAWAL:
             await message.answer(
-                f"❌ Minimum `{MINIMUM_WITHDRAWAL}` coins required!\nTry again or /cancel",
+                f"❌ Minimum `{MINIMUM_WITHDRAWAL}` coins required!\n\nTry again or /cancel",
                 parse_mode="Markdown"
             )
             return
         
-        success = DB.request_withdrawal(message.from_user.id, amount)
+        data = await state.get_data()
+        upi_id = data.get('upi_id') or DB.get_upi_id(message.from_user.id)
+        
+        if not upi_id:
+            await message.answer("❌ UPI ID missing! Please start withdrawal again.", reply_markup=main_keyboard())
+            await state.clear()
+            return
+        
+        balance = DB.get_balance(message.from_user.id)
+        if amount > balance:
+            await message.answer(
+                f"❌ Insufficient balance!\n\n💰 Your balance: `{balance}` coins\n💰 Requested: `{amount}` coins",
+                parse_mode="Markdown"
+            )
+            return
+        
+        success = DB.request_withdrawal(message.from_user.id, amount, upi_id)
         
         if success:
             await message.answer(
-                f"✅ **Withdrawal request sent!**\n\n"
-                f"💰 Amount: `{amount}` coins\n\n"
+                f"✅ **Withdrawal request submitted!**\n\n"
+                f"💰 Amount: `{amount}` coins\n"
+                f"💳 UPI ID: `{upi_id}`\n\n"
                 f"⏳ Admin will process within 24-48 hours.\n"
                 f"Thank you! 🙏",
                 reply_markup=main_keyboard(),
                 parse_mode="Markdown"
             )
             
+            # Notify admins
             for admin_id in ADMIN_IDS:
                 try:
                     await bot.send_message(
                         admin_id,
-                        f"💰 **New Withdrawal Request!**\n"
+                        f"💰 **New Withdrawal Request!**\n\n"
                         f"👤 User: `{message.from_user.id}`\n"
+                        f"👤 Username: @{message.from_user.username or 'N/A'}\n"
                         f"💰 Amount: `{amount}` coins\n"
-                        f"👤 @{message.from_user.username or 'N/A'}",
+                        f"💳 UPI ID: `{upi_id}`\n"
+                        f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                         parse_mode="Markdown"
                     )
                 except:
@@ -865,7 +932,9 @@ async def process_withdrawal(message: types.Message, state: FSMContext):
                 "❌ **Withdrawal failed!**\n\n"
                 "Possible reasons:\n"
                 "• Insufficient balance\n"
-                "• Pending withdrawal already exists",
+                "• Pending withdrawal already exists\n"
+                "• Invalid amount\n\n"
+                "Please try again later.",
                 reply_markup=main_keyboard(),
                 parse_mode="Markdown"
             )
@@ -890,7 +959,7 @@ def is_admin(user_id: int) -> bool:
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message):
     if not is_admin(message.from_user.id):
-        await message.answer("❌ Unauthorized!")
+        await message.answer("❌ You are not authorized to use this command!")
         return
     
     await message.answer(
@@ -899,73 +968,19 @@ async def admin_panel(message: types.Message):
         parse_mode="Markdown"
     )
 
-@dp.callback_query(lambda c: c.data == "admin_withdrawals")
-async def admin_withdrawals(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Unauthorized!", show_alert=True)
-        return
-    
-    withdrawals = DB.get_pending_withdrawals()
-    
-    if not withdrawals:
-        await callback.message.edit_text("✅ No pending withdrawals!", reply_markup=admin_keyboard())
-        return
-    
-    text = "💵 **Pending Withdrawals:**\n\n"
-    buttons = []
-    
-    for w in withdrawals:
-        text += f"🆔 ID: `{w['id']}` | 👤 User: `{w['user_id']}` | 💰 Amount: `{w['amount']}`\n📅 Date: {w['date']}\n\n"
-        buttons.append([
-            InlineKeyboardButton(f"✅ Approve #{w['id']}", callback_data=f"approve_{w['id']}"),
-            InlineKeyboardButton(f"❌ Reject #{w['id']}", callback_data=f"reject_{w['id']}")
-        ])
-    
-    buttons.append([InlineKeyboardButton("◀️ Back", callback_data="admin_back")])
-    
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(lambda c: c.data.startswith("approve_"))
-async def approve_withdrawal(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Unauthorized!", show_alert=True)
-        return
-    
-    withdrawal_id = int(callback.data.split("_")[1])
-    success = DB.approve_withdrawal(withdrawal_id)
-    
-    await callback.answer("✅ Approved!" if success else "❌ Failed!", show_alert=True)
-    await admin_withdrawals(callback)
-
-@dp.callback_query(lambda c: c.data.startswith("reject_"))
-async def reject_withdrawal(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Unauthorized!", show_alert=True)
-        return
-    
-    withdrawal_id = int(callback.data.split("_")[1])
-    success = DB.reject_withdrawal(withdrawal_id)
-    
-    await callback.answer("✅ Rejected & Refunded!" if success else "❌ Failed!", show_alert=True)
-    await admin_withdrawals(callback)
-
-@dp.callback_query(lambda c: c.data == "admin_back")
-async def admin_back(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Unauthorized!", show_alert=True)
-        return
-    
-    await callback.message.edit_text("🔧 **Admin Panel**\n\nSelect an option:", reply_markup=admin_keyboard(), parse_mode="Markdown")
-    await callback.answer()
-
 @dp.callback_query(lambda c: c.data == "admin_broadcast")
 async def admin_broadcast_start(callback: types.CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Unauthorized!", show_alert=True)
         return
     
-    await callback.message.edit_text("📢 **Send broadcast message**\n\nSend text, photo, or video to broadcast to all users.\nType /cancel to cancel.")
+    await callback.message.edit_text(
+        "📢 **Broadcast Message**\n\n"
+        "Send the message you want to broadcast to all users.\n\n"
+        "Supported: Text, Photos, Videos, Documents\n"
+        "Type /cancel to cancel.",
+        parse_mode="Markdown"
+    )
     await state.set_state(AdminState.broadcast)
     await callback.answer()
 
@@ -979,26 +994,112 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
     users = DB.get_all_users()
     
     if not users:
-        await message.answer("❌ No users found!")
+        await message.answer("❌ No users found in database!")
         await state.clear()
         return
     
-    success = 0
-    fail = 0
-    status = await message.answer(f"📡 Sending to {len(users)} users...")
+    success_count = 0
+    fail_count = 0
+    status_msg = await message.answer(f"📡 Sending broadcast to {len(users)} users...")
     
     for user_id in users:
         try:
             await message.copy_to(user_id)
-            success += 1
-        except:
-            fail += 1
+            success_count += 1
+        except Exception as e:
+            fail_count += 1
+            logger.error(f"Failed to send to {user_id}: {e}")
         await asyncio.sleep(0.05)
     
-    await status.edit_text(f"✅ Broadcast completed!\n\n📨 Sent: {success}\n❌ Failed: {fail}")
+    await status_msg.edit_text(
+        f"✅ **Broadcast Completed!**\n\n"
+        f"📨 Sent: `{success_count}`\n"
+        f"❌ Failed: `{fail_count}`",
+        parse_mode="Markdown"
+    )
+    
     await state.clear()
     
-    await message.answer("🔧 **Admin Panel**", reply_markup=admin_keyboard(), parse_mode="Markdown")
+    await message.answer(
+        "🔧 **Admin Panel**",
+        reply_markup=admin_keyboard(),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(lambda c: c.data == "admin_withdrawals")
+async def admin_withdrawals(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized!", show_alert=True)
+        return
+    
+    withdrawals = DB.get_pending_withdrawals()
+    
+    if not withdrawals:
+        await callback.message.edit_text(
+            "✅ **No pending withdrawals!**",
+            reply_markup=admin_keyboard(),
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+    
+    text = "💵 **Pending Withdrawals:**\n\n"
+    buttons = []
+    
+    for w in withdrawals:
+        text += f"🆔 ID: `{w['id']}`\n"
+        text += f"👤 User: `{w['user_id']}`\n"
+        text += f"💰 Amount: `{w['amount']}` coins\n"
+        text += f"💳 UPI: `{w['upi_id']}`\n"
+        text += f"📅 Date: {w['date']}\n\n"
+        
+        buttons.append([
+            InlineKeyboardButton(f"✅ Approve #{w['id']}", callback_data=f"approve_{w['id']}"),
+            InlineKeyboardButton(f"❌ Reject #{w['id']}", callback_data=f"reject_{w['id']}")
+        ])
+    
+    buttons.append([InlineKeyboardButton("◀️ Back to Admin", callback_data="admin_back")])
+    
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("approve_"))
+async def approve_withdrawal(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized!", show_alert=True)
+        return
+    
+    withdrawal_id = int(callback.data.split("_")[1])
+    success = DB.approve_withdrawal(withdrawal_id)
+    
+    if success:
+        await callback.answer("✅ Withdrawal approved!", show_alert=True)
+    else:
+        await callback.answer("❌ Failed to approve!", show_alert=True)
+    
+    # Refresh withdrawals list
+    await admin_withdrawals(callback)
+
+@dp.callback_query(lambda c: c.data.startswith("reject_"))
+async def reject_withdrawal(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized!", show_alert=True)
+        return
+    
+    withdrawal_id = int(callback.data.split("_")[1])
+    success = DB.reject_withdrawal(withdrawal_id)
+    
+    if success:
+        await callback.answer("✅ Withdrawal rejected & refunded!", show_alert=True)
+    else:
+        await callback.answer("❌ Failed to reject!", show_alert=True)
+    
+    # Refresh withdrawals list
+    await admin_withdrawals(callback)
 
 @dp.callback_query(lambda c: c.data == "admin_stats")
 async def admin_stats(callback: types.CallbackQuery):
@@ -1009,22 +1110,26 @@ async def admin_stats(callback: types.CallbackQuery):
     total_users = DB.get_total_users()
     total_stories = DB.get_total_stories_read()
     total_balance = DB.get_total_balance()
-    pending = len(DB.get_pending_withdrawals())
+    pending_withdrawals = len(DB.get_pending_withdrawals())
     
     text = (
         f"📊 **Bot Statistics**\n\n"
         f"👥 Total users: `{total_users}`\n"
         f"📚 Total stories read: `{total_stories}`\n"
         f"💰 Total balance: `{total_balance}` coins\n"
-        f"💸 Pending withdrawals: `{pending}`\n\n"
+        f"💸 Pending withdrawals: `{pending_withdrawals}`\n\n"
         f"⚙️ **Settings:**\n"
         f"• Daily limit: `{DAILY_STORY_LIMIT}` stories\n"
         f"• Reward per story: `{STORY_READ_REWARD}` coin\n"
         f"• Referral bonus: `{REFERRAL_BONUS}` coins\n"
-        f"• Min withdrawal: `{MINIMUM_WITHDRAWAL}` coins"
+        f"• Minimum withdrawal: `{MINIMUM_WITHDRAWAL}` coins"
     )
     
-    await callback.message.edit_text(text, reply_markup=admin_keyboard(), parse_mode="Markdown")
+    await callback.message.edit_text(
+        text,
+        reply_markup=admin_keyboard(),
+        parse_mode="Markdown"
+    )
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "admin_refresh")
@@ -1033,7 +1138,7 @@ async def admin_refresh(callback: types.CallbackQuery):
         await callback.answer("Unauthorized!", show_alert=True)
         return
     
-    await callback.message.edit_text("🔄 Refreshing stories with Selenium...\n⏳ Please wait...")
+    await callback.message.edit_text("🔄 Refreshing stories from website...\n⏳ Please wait...")
     
     FETCHER.last_update = None
     stories = await FETCHER.get_stories()
@@ -1047,8 +1152,8 @@ async def admin_refresh(callback: types.CallbackQuery):
         )
     else:
         await callback.message.edit_text(
-            "❌ **No stories on website!**\n\n"
-            "Check if website has stories:\n"
+            f"❌ **No stories found on website!**\n\n"
+            f"Please check if website has stories:\n"
             f"🔗 {WEBSITE_URL}",
             reply_markup=admin_keyboard(),
             parse_mode="Markdown"
@@ -1061,7 +1166,7 @@ async def admin_debug(callback: types.CallbackQuery):
         await callback.answer("Unauthorized!", show_alert=True)
         return
     
-    await callback.message.edit_text("🔍 Debugging with Selenium...\n⏳ Please wait...")
+    await callback.message.edit_text("🔍 Debugging website...\n⏳ Please wait...")
     
     try:
         driver = FETCHER.get_driver()
@@ -1090,19 +1195,104 @@ async def admin_debug(callback: types.CallbackQuery):
             if story_links:
                 debug_text += "**Story URLs:**\n" + "\n".join(story_links[:10])
             else:
-                debug_text += "❌ No story links found!\n\n"
-                debug_text += "Website structure check karo."
+                debug_text += "❌ No story links found on homepage!\n\n"
+                debug_text += "Check if website has '/story/' links."
             
-            await callback.message.edit_text(debug_text[:4000], reply_markup=admin_keyboard(), parse_mode="Markdown")
+            await callback.message.edit_text(
+                debug_text[:4000],
+                reply_markup=admin_keyboard(),
+                parse_mode="Markdown"
+            )
         else:
-            await callback.message.edit_text("❌ Failed to initialize Selenium!\n\nCheck Chrome installation.", reply_markup=admin_keyboard())
+            await callback.message.edit_text(
+                "❌ Failed to initialize Selenium!\n\nPlease check Chrome installation.",
+                reply_markup=admin_keyboard()
+            )
             
     except Exception as e:
-        await callback.message.edit_text(f"❌ Debug error: {e}", reply_markup=admin_keyboard())
+        await callback.message.edit_text(
+            f"❌ Debug error: {e}",
+            reply_markup=admin_keyboard()
+        )
     
     await callback.answer()
 
-# Track story reads
+@dp.callback_query(lambda c: c.data == "admin_users")
+async def admin_users(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized!", show_alert=True)
+        return
+    
+    users = DB.get_all_users_list(20)
+    
+    if not users:
+        await callback.message.edit_text(
+            "📋 **No users found!**",
+            reply_markup=admin_keyboard(),
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+    
+    text = "📋 **Recent Users:**\n\n"
+    for user in users:
+        text += f"🆔 `{user[0]}` | 👤 {user[2] or 'N/A'}\n"
+        text += f"💰 Balance: `{user[3]}` | 📚 Read: `{user[4]}` stories\n"
+        if user[1]:
+            text += f"📱 @{user[1]}\n"
+        text += "\n"
+    
+    await callback.message.edit_text(
+        text[:3000],
+        reply_markup=admin_keyboard(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "admin_back")
+async def admin_back(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "🔧 **Admin Panel**\n\nSelect an option:",
+        reply_markup=admin_keyboard(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+# Track story reads from WebApp
+@dp.message(lambda message: message.web_app_data)
+async def handle_web_app_data(message: types.Message):
+    try:
+        data = json.loads(message.web_app_data.data)
+        story_url = data.get('url', '')
+        
+        if story_url:
+            rewarded, reason = DB.reward_story(message.from_user.id, story_url)
+            
+            if rewarded:
+                await message.answer(
+                    f"✅ **+{STORY_READ_REWARD} coin earned!**\n"
+                    f"💰 New balance: `{DB.get_balance(message.from_user.id)}` coins",
+                    parse_mode="Markdown",
+                    disable_notification=True
+                )
+            elif reason == "daily_limit":
+                await message.answer(
+                    f"⚠️ **Daily limit reached!**\n"
+                    f"You've read `{DAILY_STORY_LIMIT}` stories today.\n"
+                    f"Come back tomorrow! 🌙",
+                    parse_mode="Markdown",
+                    disable_notification=True
+                )
+    except json.JSONDecodeError:
+        pass
+    except Exception as e:
+        logger.error(f"WebApp data error: {e}")
+
+# Track story reads from shared links
 @dp.message(lambda message: message.text and WEBSITE_URL in message.text)
 async def track_story_read(message: types.Message):
     story_url = None
@@ -1134,19 +1324,22 @@ async def track_story_read(message: types.Message):
 async def main():
     logger.info("🚀 Bot starting...")
     
-    logger.info("📚 Fetching stories with Selenium...")
+    # Pre-fetch stories
+    logger.info("📚 Fetching stories from website...")
     stories = await FETCHER.get_stories()
     logger.info(f"✅ Found {len(stories)} stories")
     
+    # Set bot commands
     await bot.set_my_commands([
-        types.BotCommand(command="start", description="🚀 Start bot"),
-        types.BotCommand(command="cancel", description="❌ Cancel operation"),
-        types.BotCommand(command="admin", description="🔧 Admin panel")
+        types.BotCommand(command="start", description="🚀 Start the bot"),
+        types.BotCommand(command="cancel", description="❌ Cancel current operation"),
+        types.BotCommand(command="admin", description="🔧 Admin panel (admins only)")
     ])
     
+    # Remove webhook and start polling
     await bot.delete_webhook(drop_pending_updates=True)
     
-    logger.info("✅ Bot is running!")
+    logger.info("✅ Bot is running with all features!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
