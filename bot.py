@@ -217,7 +217,7 @@ class Database:
         """, (user_id,))
         user_data = cursor.fetchone()
 
-        # Count referrals where this user is the referrer
+        # Count referrals where this user is the referrer AND reward was given
         cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND reward_given = 1", (user_id,))
         referral_count = cursor.fetchone()[0]
         
@@ -1285,7 +1285,7 @@ async def admin_refresh(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "admin_debug")
 async def admin_debug(callback: types.CallbackQuery):
-    if not is_admin(callback.from.user.id):
+    if not is_admin(callback.from_user.id):  # FIXED: from_user (underscore)
         await callback.answer("Unauthorized!", show_alert=True)
         return
     
